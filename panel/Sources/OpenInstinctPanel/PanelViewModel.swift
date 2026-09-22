@@ -23,13 +23,25 @@ public final class PanelViewModel: ObservableObject {
 
     private let transport: any ControlTransport
     private let daemonKickstart: @Sendable () async throws -> Void
+    private let requestTimeout: UInt64
+    private let recoveryTimeout: UInt64
+    private var recoveryGeneration = 0
+    private var recoveryTask: Task<Void, Never>?
+    private var forceRecoveryInProgress = false
+    private var statusRefreshGeneration = 0
+    private var monitorsRefreshGeneration = 0
+    private var modelsRefreshGeneration = 0
 
     public init(
         transport: any ControlTransport = UnixSocketTransport(),
-        daemonKickstart: (@Sendable () async throws -> Void)? = nil
+        daemonKickstart: (@Sendable () async throws -> Void)? = nil,
+        requestTimeout: UInt64 = 8_000_000_000,
+        recoveryTimeout: UInt64 = 35_000_000_000
     ) {
         self.transport = transport
         self.daemonKickstart = daemonKickstart ?? { try await PanelViewModel.kickstartDaemon() }
+        self.requestTimeout = requestTimeout
+        self.recoveryTimeout = recoveryTimeout
     }
 
     /// Turns a provider/model id into a short label suitable for the status popover.
@@ -62,8 +74,9 @@ public final class PanelViewModel: ObservableObject {
     }
 
     public func refresh() async {
+        let generation = recoveryGeneration
         await refreshStatus()
-        guard connectionState == .connected else {
+        guard !Task.isCancelled, generation == recoveryGeneration, connectionState == .connected else {
             return
         }
         await refreshMonitors()
@@ -71,8 +84,9 @@ public final class PanelViewModel: ObservableObject {
 
     /// The panel's reload button: everything `refresh()` does plus a forced model-list reload.
     public func reload() async {
+        let generation = recoveryGeneration
         await refresh()
-        guard connectionState == .connected else {
+        guard !Task.isCancelled, generation == recoveryGeneration, connectionState == .connected else {
             return
         }
         await refreshModels()
@@ -80,8 +94,11 @@ public final class PanelViewModel: ObservableObject {
 
     /// Forces the daemon to re-run `gjc --list-models`, dropping its cached list and restarting its TTL.
     public func refreshModels() async {
+        modelsRefreshGeneration += 1
+        let generation = modelsRefreshGeneration
         do {
-            let frame = try await transport.request(.modelsList(id: requestID(), payload: ModelsListPayload(refresh: true)))
+            let frame = try await requestControl(.modelsList(id: requestID(), payload: ModelsListPayload(refresh: true)))
+            guard generation == modelsRefreshGeneration else { return }
             switch frame {
             case .response(.modelsList):
                 modelsRefreshedAt = Date()
@@ -91,13 +108,17 @@ public final class PanelViewModel: ObservableObject {
                 throw PanelModelError.unexpectedFrame
             }
         } catch {
+            guard generation == modelsRefreshGeneration else { return }
             markDaemonAbsent(error)
         }
     }
 
     public func refreshStatus() async {
+        statusRefreshGeneration += 1
+        let generation = statusRefreshGeneration
         do {
-            let frame = try await transport.request(.statusGet(id: requestID()))
+            let frame = try await requestControl(.statusGet(id: requestID()))
+            guard generation == statusRefreshGeneration else { return }
             guard case .response(.status(_, let payload)) = frame else {
                 throw PanelModelError.unexpectedFrame
             }
@@ -105,13 +126,17 @@ public final class PanelViewModel: ObservableObject {
             connectionState = .connected
             connectionError = nil
         } catch {
+            guard generation == statusRefreshGeneration else { return }
             markDaemonAbsent(error)
         }
     }
 
     public func refreshMonitors() async {
+        monitorsRefreshGeneration += 1
+        let generation = monitorsRefreshGeneration
         do {
-            let frame = try await transport.request(.monitorsList(id: requestID()))
+            let frame = try await requestControl(.monitorsList(id: requestID()))
+            guard generation == monitorsRefreshGeneration else { return }
             guard case .response(.monitorsList(_, let payload)) = frame else {
                 throw PanelModelError.unexpectedFrame
             }
@@ -119,13 +144,14 @@ public final class PanelViewModel: ObservableObject {
             connectionState = .connected
             connectionError = nil
         } catch {
+            guard generation == monitorsRefreshGeneration else { return }
             markDaemonAbsent(error)
         }
     }
 
     public func openBrowserProfile() async {
         do {
-            let frame = try await transport.request(.browserOpen(id: requestID()))
+            let frame = try await requestControl(.browserOpen(id: requestID()))
             switch frame {
             case .response(.browserOpen): notice = "Gajae's browser opened. Sign into the sites you want it to use, then just close the window."
             case .error(let error): notice = error.message
@@ -138,7 +164,7 @@ public final class PanelViewModel: ObservableObject {
 
     public func resetSession() async {
         do {
-            let frame = try await transport.request(.sessionReset(id: requestID()))
+            let frame = try await requestControl(.sessionReset(id: requestID()))
             switch frame {
             case .response(.sessionReset): notice = "Fresh conversation started. Memory is kept."; await refresh()
             case .error(let error): notice = error.message
@@ -152,7 +178,7 @@ public final class PanelViewModel: ObservableObject {
     public func setFastMode(_ enabled: Bool) async {
         guard status?.session.fastModeAvailable == true else { return }
         do {
-            let frame = try await transport.request(.settingsSet(
+            let frame = try await requestControl(.settingsSet(
                 id: requestID(),
                 payload: SettingsSetPayload(patch: ["fastMode": .bool(enabled)])
             ))
@@ -166,6 +192,7 @@ public final class PanelViewModel: ObservableObject {
                 throw PanelModelError.unexpectedFrame
             }
         } catch {
+            guard !(error is CancellationError), !Task.isCancelled else { return }
             notice = "Fast mode could not be changed. Gajae will keep using normal speed."
             await refreshStatus()
         }
@@ -182,52 +209,85 @@ public final class PanelViewModel: ObservableObject {
     }
 
     private func runRecovery(resetConversation: Bool) async {
-        guard !recoveryInProgress else { return }
+        if let recoveryTask {
+            // Repeated confirmed force clicks join the same reset, never send
+            // a second destructive request with an uncertain first outcome.
+            if forceRecoveryInProgress || !resetConversation {
+                await recoveryTask.value
+                return
+            }
+            recoveryTask.cancel()
+        }
+        recoveryGeneration += 1
+        let generation = recoveryGeneration
         recoveryInProgress = true
-        defer { recoveryInProgress = false }
+        forceRecoveryInProgress = resetConversation
         notice = resetConversation ? "Starting a fresh conversation safely…" : "Restarting Gajae…"
-
-        do {
-            var resetCompleted = !resetConversation
-            if resetConversation {
-                if connectionState != .connected || status?.session.state != .active {
-                    try await kickstartAndReconnect()
+        let task = Task {
+            do {
+                try await boundedControlOperation(timeout: recoveryTimeout) {
+                    try await self.performRecovery(resetConversation: resetConversation)
                 }
-                do {
-                    try await requestSessionReset()
-                    resetCompleted = true
-                } catch {
-                    // Retry on the clean process after the forced restart.
-                    resetCompleted = false
-                }
+                guard generation == recoveryGeneration else { return }
+                notice = resetConversation
+                    ? "Fresh conversation started. Your memory and settings are safe."
+                    : "Gajae restarted. Your conversation and settings are unchanged."
+            } catch {
+                guard generation == recoveryGeneration else { return }
+                notice = resetConversation
+                    ? "Gajae could not confirm the fresh start: \(error.localizedDescription) The conversation may have reset; no reset was retried. Memory and settings are safe."
+                    : "Gajae could not restart automatically: \(error.localizedDescription) Try Force Restart & Reset."
             }
+            guard generation == recoveryGeneration else { return }
+            recoveryInProgress = false
+            forceRecoveryInProgress = false
+            recoveryTask = nil
+        }
+        recoveryTask = task
+        await task.value
+    }
 
+    private func performRecovery(resetConversation: Bool) async throws {
+        try Task.checkCancellation()
+        if resetConversation {
+            // Escape the control socket first, even if its last status was healthy.
+            try await kickstartAndReconnect()
+            try Task.checkCancellation()
+            try await requestSessionReset()
+        } else {
             try await restartDaemonReliably()
-            if resetConversation && !resetCompleted {
-                try await requestSessionReset()
+        }
+        try Task.checkCancellation()
+        await refreshStatus()
+        try Task.checkCancellation()
+        guard connectionState == .connected,
+              status?.bootstrap.state == .running,
+              status?.session.state == .active else {
+            throw RecoveryError.daemonUnavailable
+        }
+    }
+
+    private func requestControl(_ request: ControlRequest) async throws -> ControlFrame {
+        let generation = recoveryGeneration
+        do {
+            let frame = try await boundedControlOperation(timeout: requestTimeout) { [transport] in
+                try await transport.request(request)
             }
-            await refreshStatus()
-            guard connectionState == .connected,
-                  status?.bootstrap.state == .running,
-                  status?.session.state == .active else {
-                throw RecoveryError.daemonUnavailable
-            }
-            notice = resetConversation
-                ? "Fresh conversation started. Your memory and settings are safe."
-                : "Gajae restarted. Your conversation and settings are unchanged."
+            try Task.checkCancellation()
+            guard generation == recoveryGeneration else { throw CancellationError() }
+            return frame
         } catch {
-            notice = resetConversation
-                ? "Gajae could not finish the fresh start. Your memory and settings are safe; try again in a moment."
-                : "Gajae could not restart automatically. Try Force Restart & Reset again in a moment."
+            guard generation == recoveryGeneration, !Task.isCancelled else { throw CancellationError() }
+            throw error
         }
     }
 
     private func requestSessionReset() async throws {
-        let frame = try await transport.request(.sessionReset(id: requestID()))
+        let frame = try await requestControl(.sessionReset(id: requestID()))
         switch frame {
-        case .response(.sessionReset):
+        case .response(.sessionReset(_, let payload)) where payload.reset:
             return
-        case .error:
+        case .response(.sessionReset), .error:
             throw RecoveryError.controlUnavailable
         default:
             throw PanelModelError.unexpectedFrame
@@ -235,7 +295,7 @@ public final class PanelViewModel: ObservableObject {
     }
 
     private func requestDaemonRestart() async throws {
-        let frame = try await transport.request(.daemonRestart(id: requestID()))
+        let frame = try await requestControl(.daemonRestart(id: requestID()))
         switch frame {
         case .response(.daemonRestart(_, let payload)) where payload.restarting:
             return
@@ -253,13 +313,15 @@ public final class PanelViewModel: ObservableObject {
             try await requestDaemonRestart()
             try await waitForRestartCycle()
         } catch {
-            try await daemonKickstart()
-            try await waitForDaemon()
+            try Task.checkCancellation()
+            try await kickstartAndReconnect()
         }
     }
 
     private func kickstartAndReconnect() async throws {
-        try await daemonKickstart()
+        try Task.checkCancellation()
+        try await boundedControlOperation(timeout: requestTimeout, operation: daemonKickstart)
+        try Task.checkCancellation()
         try await waitForDaemon()
     }
 
@@ -269,6 +331,7 @@ public final class PanelViewModel: ObservableObject {
                 try await Task.sleep(nanoseconds: 300_000_000)
             }
             await refreshStatus()
+            try Task.checkCancellation()
             if connectionState == .connected,
                status?.bootstrap.state == .running,
                status?.session.state == .active {
@@ -283,6 +346,7 @@ public final class PanelViewModel: ObservableObject {
         for _ in 0..<50 {
             try await Task.sleep(nanoseconds: 300_000_000)
             await refreshStatus()
+            try Task.checkCancellation()
             let ready = connectionState == .connected
                 && status?.bootstrap.state == .running
                 && status?.session.state == .active
@@ -297,7 +361,7 @@ public final class PanelViewModel: ObservableObject {
 
     public func reloadPersona() async {
         do {
-            let frame = try await transport.request(.sessionReload(id: requestID()))
+            let frame = try await requestControl(.sessionReload(id: requestID()))
             switch frame {
             case .response(.sessionReload(_, let payload)):
                 notice = "Persona reloaded (soul v\(payload.soulVersion))."
@@ -312,6 +376,7 @@ public final class PanelViewModel: ObservableObject {
     }
 
     public func deleteMonitor(id: String) async {
+        let generation = recoveryGeneration
         guard let monitor = monitors.first(where: { $0.id == id }) else {
             return
         }
@@ -322,14 +387,14 @@ public final class PanelViewModel: ObservableObject {
                 id: requestID(),
                 payload: MonitorDeletePayload(id: id, expectedRevision: monitor.revision)
             )
-            let frame = try await transport.request(request)
+            let frame = try await requestControl(request)
             switch frame {
             case .response(.monitorsDelete(_, let payload)) where payload.deleted:
                 monitors.removeAll { $0.id == id }
                 notice = nil
             case .error(let error) where error.code == .revisionConflict:
                 await refreshMonitors()
-                if connectionState == .connected {
+                if generation == recoveryGeneration, !Task.isCancelled, connectionState == .connected {
                     notice = "Monitor changed elsewhere. Refreshed its current state."
                 }
             case .error(let error) where error.code == .monitorBusy:
@@ -345,6 +410,7 @@ public final class PanelViewModel: ObservableObject {
     }
 
     public func toggleMonitor(id: String, enabled: Bool) async {
+        let generation = recoveryGeneration
         guard let monitor = monitors.first(where: { $0.id == id }) else {
             return
         }
@@ -356,14 +422,14 @@ public final class PanelViewModel: ObservableObject {
                 id: requestID(),
                 payload: MonitorTogglePayload(id: id, enabled: enabled, expectedRevision: monitor.revision)
             )
-            let frame = try await transport.request(request)
+            let frame = try await requestControl(request)
             switch frame {
             case .response(.monitorsToggle(_, let payload)):
                 replaceMonitor(payload.monitor)
                 notice = nil
             case .error(let error) where error.code == .revisionConflict:
                 await refreshMonitors()
-                if connectionState == .connected {
+                if generation == recoveryGeneration, !Task.isCancelled, connectionState == .connected {
                     notice = "Monitor changed elsewhere. Refreshed its current state."
                 }
             case .error(let error):
@@ -384,7 +450,7 @@ public final class PanelViewModel: ObservableObject {
         defer { runningMonitorIDs.remove(id) }
         do {
             let request = ControlRequest.monitorsRun(id: requestID(), payload: MonitorRunPayload(id: id))
-            switch try await transport.request(request) {
+            switch try await requestControl(request) {
             case .response(.monitorsRun(_, let payload)):
                 notice = payload.dispatched
                     ? "Running \"\(monitor.name)\" now."
@@ -404,7 +470,7 @@ public final class PanelViewModel: ObservableObject {
             let request: ControlRequest = paused
                 ? .daemonPause(id: requestID())
                 : .daemonResume(id: requestID())
-            let frame = try await transport.request(request)
+            let frame = try await requestControl(request)
             guard case .response(.daemonPause(_, let payload)) = frame, payload.paused == paused else {
                 throw PanelModelError.unexpectedFrame
             }
@@ -427,8 +493,9 @@ public final class PanelViewModel: ObservableObject {
     }
 
     private func markDaemonAbsent(_ error: Error) {
-        // Only a transport failure means "not running". A frame we cannot decode
-        // means the daemon is newer than this panel: keep the last good state.
+        guard !(error is CancellationError), !Task.isCancelled else { return }
+        // A transport failure means "not responding", not proof of a stopped daemon.
+        // An undecodable frame may mean a newer daemon: keep the last good state.
         if error is PanelModelError || error is DecodingError || error is ControlCodecError {
             connectionError = "Gajae is running but this panel is out of date. Reinstall to update it."
             if status == nil { connectionState = .absent }
@@ -437,34 +504,61 @@ public final class PanelViewModel: ObservableObject {
         connectionState = .absent
         status = nil
         monitors = []
-        connectionError = "Gajae is not responding. Try Restart Gajae or Force Restart & Reset."
-    }
-
-    private struct LaunchctlResult: Sendable {
-        let status: Int32
+        connectionError = "\(error.localizedDescription) Try refreshing again, Restart Gajae, or Force Restart & Reset."
     }
 
     nonisolated static func kickstartDaemon() async throws {
-        let result = await Task.detached(priority: .userInitiated) {
-            PanelViewModel.runLaunchctlKickstart()
-        }.value
-        guard result.status == 0 else {
-            throw RecoveryError.kickstartFailed
+        let command = LaunchctlKickstart()
+        let result = await withTaskCancellationHandler {
+            await Task.detached(priority: .userInitiated) { command.run() }.value
+        } onCancel: {
+            command.cancel()
         }
+        try Task.checkCancellation()
+        guard result == 0 else { throw RecoveryError.kickstartFailed }
     }
 
-    private nonisolated static func runLaunchctlKickstart() -> LaunchctlResult {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        process.arguments = ["kickstart", "-k", "gui/\(getuid())/co.openinstinct.daemon"]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-            process.waitUntilExit()
-            return LaunchctlResult(status: process.terminationStatus)
-        } catch {
-            return LaunchctlResult(status: -1)
+    /// Synchronizes cancellation with process launch, including cancellation
+    /// before the detached worker starts. Only this launchctl child is killed.
+    private final class LaunchctlKickstart: @unchecked Sendable {
+        private let lock = NSLock()
+        private let process = Process()
+        private let exited = DispatchSemaphore(value: 0)
+        private var cancelled = false
+
+        func run() -> Int32 {
+            lock.lock()
+            guard !cancelled else {
+                lock.unlock()
+                return -1
+            }
+            process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            process.arguments = ["kickstart", "-k", "gui/\(getuid())/co.openinstinct.daemon"]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            process.terminationHandler = { [exited] _ in exited.signal() }
+            do {
+                try process.run()
+            } catch {
+                lock.unlock()
+                return -1
+            }
+            lock.unlock()
+            guard exited.wait(timeout: .now() + 5) == .success else {
+                cancel()
+                return -1
+            }
+            lock.lock()
+            defer { lock.unlock() }
+            return cancelled || process.isRunning ? -1 : process.terminationStatus
+        }
+
+        func cancel() {
+            lock.lock()
+            defer { lock.unlock() }
+            cancelled = true
+            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+            exited.signal()
         }
     }
 
@@ -473,10 +567,18 @@ public final class PanelViewModel: ObservableObject {
     }
 }
 
-private enum RecoveryError: Error {
+private enum RecoveryError: LocalizedError {
     case controlUnavailable
     case daemonUnavailable
     case kickstartFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .controlUnavailable: return "The daemon did not acknowledge the recovery request."
+        case .daemonUnavailable: return "The daemon did not become ready before the recovery deadline."
+        case .kickstartFailed: return "launchctl failed or did not finish within five seconds."
+        }
+    }
 }
 
 private enum PanelModelError: LocalizedError {

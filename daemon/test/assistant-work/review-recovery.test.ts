@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -234,6 +235,110 @@ function prepareStartedFollowup(
 }
 
 describe("review recovery boundary regressions", () => {
+  test("captured dispatch identity retains its derived attempt while excluding newly admitted standalone identities", async () => {
+    const store = openStateStore(stateDbPath());
+    try {
+      const fixture = setupMessage(store, "captured-dispatch");
+      setPolicy(store, fixture.work.id, fixture.action.id);
+      const claim = store.assistantWork.claimDueFollowup(fixture.work.id, FOLLOWUP_WORKER, T1);
+      if (claim.kind !== "claimed") throw new Error("expected claimed fixture");
+      const executor = managedConfirmedExecutor(store.assistantWork, () => T2);
+      const service = new FollowupRecoveryService({ repository: store.assistantWork, workerId: FOLLOWUP_WORKER, now: () => T2, dispatch: executor.dispatch });
+      const scope = service.captureRecoveryScope();
+      expect(scope.attempts).toHaveLength(0);
+      claimAction(store.assistantWork, claim.action, "original-dispatch-later-attempt", "old-dispatch-worker", T1);
+      const live = setupMessage(store, "new-standalone", { confirmed: false }).action;
+      claimAction(store.assistantWork, live, "new-standalone-attempt", "live-worker", T1);
+      const before = store.assistantWork.getAttempt("new-standalone-attempt");
+      await service.recover(scope);
+      expect(executor.calls.map((call) => call.attemptId)).toEqual(["original-dispatch-later-attempt"]);
+      expect(store.assistantWork.getAttempt("new-standalone-attempt")).toEqual(before);
+      await service.recover(scope);
+      expect(executor.calls).toHaveLength(1);
+      expect(store.assistantWork.getAttempt("new-standalone-attempt")).toEqual(before);
+    } finally { store.close(); }
+  });
+  test("reopened obsolete claimed dispatches cannot starve standalone recovery or bypass association", async () => {
+    const path = stateDbPath();
+    const initial = openStateStore(path);
+    // An obsolete claimed dispatch on this branch is one whose action reached a
+    // terminal state after the claim: the recovered dispatch must re-check live
+    // authority and refuse, never replay. `approval_pending` and `authorized`
+    // are ordinary gated states here, so they are not the obsolete case.
+    const obsolete = ["cancelled", "expired", "blocked"].map((state) => {
+      const fixture = setupMessage(initial, state);
+      setPolicy(initial, fixture.work.id, fixture.action.id);
+      const claim = initial.assistantWork.claimDueFollowup(fixture.work.id, FOLLOWUP_WORKER, T1);
+      if (claim.kind !== "claimed") throw new Error("expected claimed fixture");
+      return { state, claim };
+    });
+    const associated = prepareClaimedFollowup(initial, "failed-associated");
+    const broken = setupMessage(initial, "broken-standalone", { confirmed: false }).action;
+    claimAction(initial.assistantWork, broken, "broken-standalone-attempt", "old-worker", T1);
+    const pre = setupMessage(initial, "standalone-pre", { confirmed: false }).action;
+    const started = setupMessage(initial, "standalone-started", { confirmed: false }).action;
+    claimAction(initial.assistantWork, pre, "healthy-pre", "old-worker", T1);
+    claimAction(initial.assistantWork, started, "healthy-started", "old-worker", T1);
+    initial.assistantWork.markEffectStarted({ attemptId: "healthy-started", workerId: "old-worker" }, T1);
+    initial.close();
+    const db = new Database(path);
+    try {
+      for (const entry of obsolete) db.query("UPDATE assistant_work_actions SET state = ? WHERE id = ?").run(entry.state, entry.claim.action.id);
+    } finally { db.close(); }
+    const store = openStateStore(path);
+    try {
+      const confirming = managedConfirmedExecutor(store.assistantWork, () => T2);
+      const executorFailure = new Error("executor unavailable for the broken standalone action");
+      const calls: string[] = [];
+      const service = new FollowupRecoveryService({
+        repository: store.assistantWork,
+        workerId: FOLLOWUP_WORKER,
+        now: () => T2,
+        // One record's executor failure must not starve the others.
+        dispatch: async (action, attemptId, workerId) => {
+          calls.push(attemptId);
+          if (action.id === broken.id) throw executorFailure;
+          return confirming.dispatch(action, attemptId, workerId);
+        },
+      });
+      const results = await service.recover();
+      const failures = results.filter((result) => result.kind === "recovery_failed");
+      expect(failures).toHaveLength(1);
+      expect(failures).toContainEqual(expect.objectContaining({ kind: "recovery_failed", actionId: broken.id, attemptId: "broken-standalone-attempt" }));
+      expect(failures[0]?.error).toBeInstanceOf(Error);
+      expect(failures[0]?.error.cause).toBe(executorFailure);
+      // Each obsolete dispatch is completed with its refusal reason recorded and
+      // no attempt row, rather than being replayed or left claimed forever.
+      const refusals = results.filter((result) => result.kind === "dispatched" && result.result.kind === "rejected");
+      expect(refusals).toHaveLength(obsolete.length);
+      expect(refusals.map((refusal) => refusal.kind === "dispatched" ? refusal.dispatch.outcome : undefined))
+        .toEqual(expect.arrayContaining(obsolete.map((entry) => ({ kind: "rejected", detail: { reason: entry.state } }))));
+      // Obsolete dispatches do reach the executor under a derived attempt id;
+      // the refusal is the ledger's claim rejection, which writes no attempt row.
+      expect(calls.filter((attemptId) => attemptId === "healthy-pre" || attemptId === "broken-standalone-attempt"))
+        .toEqual(["healthy-pre", "broken-standalone-attempt"]);
+      expect(store.assistantWork.getAttempt("healthy-pre")?.state).toBe("confirmed");
+      expect(store.assistantWork.getAttempt("healthy-started")?.state).toBe("ambiguous");
+      // Nothing fails for the associated follow-up here, so it recovers through
+      // its own executor exactly once instead of being skipped.
+      expect(store.assistantWork.getAttempt(associated.attemptId)).toMatchObject({ state: "confirmed", workerId: FOLLOWUP_WORKER, recoveryCount: 1 });
+      expect(store.assistantWork.listPendingFollowupReports()).toContainEqual(expect.objectContaining({ attemptId: "healthy-started", code: "attempt_reconcile_only" }));
+      await service.recover();
+      expect(calls.filter((attemptId) => attemptId === "healthy-pre")).toHaveLength(1);
+      expect(store.assistantWork.listAttempts(pre.id)).toHaveLength(1);
+      expect(store.assistantWork.listAttempts(started.id)).toHaveLength(1);
+      expect(store.assistantWork.listAttempts(associated.action.id)).toHaveLength(1);
+      for (const entry of obsolete) {
+        expect(store.assistantWork.getFollowupDispatch(entry.claim.dispatch.id)?.state).toBe("completed");
+        expect(store.assistantWork.listAttempts(entry.claim.action.id)).toHaveLength(0);
+      }
+      const preserved = new Database(path, { readonly: true });
+      try {
+        for (const entry of obsolete) expect(preserved.query("SELECT state, current_digest FROM assistant_work_actions WHERE id = ?").get(entry.claim.action.id))
+          .toEqual({ state: entry.state, current_digest: entry.claim.action.digest });
+      } finally { preserved.close(); }
+    } finally { store.close(); }
+  });
   test("verified follow-up resolution creates one report and replay preserves schedule", () => {
     const store = openStateStore(stateDbPath());
     try {

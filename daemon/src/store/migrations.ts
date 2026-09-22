@@ -5,7 +5,7 @@ export interface Migration {
   readonly requiresForeignKeysDisabled?: boolean;
 }
 
-export const LATEST_SCHEMA_VERSION = 9;
+export const LATEST_SCHEMA_VERSION = 10;
 
 export const MIGRATIONS: readonly Migration[] = [
   {
@@ -553,6 +553,21 @@ export const MIGRATIONS: readonly Migration[] = [
       );
       CREATE INDEX assistant_work_notification_routes_recovery_idx
         ON assistant_work_notification_routes (state, dispatching_at, notification_id, route);
+    `,
+  },
+  {
+    version: 10,
+    sql: `
+      CREATE TABLE trusted_peers (
+        id TEXT PRIMARY KEY,
+        handle TEXT NOT NULL UNIQUE,
+        display_name TEXT NOT NULL,
+        relation TEXT NOT NULL CHECK (relation IN ('household', 'colleague', 'professional', 'business')),
+        state TEXT NOT NULL CHECK (state IN ('trusted', 'revoked')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX trusted_peers_state_idx ON trusted_peers (state, created_at, handle);
     `,
   },
 ];

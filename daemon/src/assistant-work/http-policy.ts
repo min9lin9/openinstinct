@@ -33,6 +33,12 @@ export function configuredHttpAccess(env: Readonly<Record<string, string | undef
   readonly endpointPolicy: ManagedHttpEndpointPolicy;
   readonly resolveSecret: ManagedHttpSecretResolver;
   readonly authorizeMessage: ManagedHttpMessageAuthorizer;
+  readonly assertCapabilityCredential: (input: {
+    readonly label: string;
+    readonly secretRef: string;
+    readonly url: string;
+    readonly headerName: string;
+  }) => void;
 } {
   const originsValue: unknown = JSON.parse(env.OI_HTTP_LOCAL_ORIGINS ?? "[]");
   if (!Array.isArray(originsValue) || originsValue.some((value) => typeof value !== "string")) {
@@ -56,10 +62,13 @@ export function configuredHttpAccess(env: Readonly<Record<string, string | undef
   }
   // Snapshot host credentials rather than reading mutable model-controlled request fields.
   const values = new Map([...bindings].map(([reference, binding]) => [reference, env[binding.environment]]));
-  return {
-    endpointPolicy: (endpoint) => ({ allowed: true, allowPrivateNetwork: localOrigins.has(endpoint.origin) }),
-    authorizeMessage: (plan) => authorizeMessagePlan(plan, messageBindings),
-    resolveSecret: (reference, context) => {
+  const access = {
+    endpointPolicy: (endpoint: Parameters<ManagedHttpEndpointPolicy>[0]) => ({
+      allowed: true,
+      allowPrivateNetwork: localOrigins.has(endpoint.origin),
+    }),
+    authorizeMessage: (plan: ManagedHttpPlan) => authorizeMessagePlan(plan, messageBindings),
+    resolveSecret: (reference: string, context: Parameters<ManagedHttpSecretResolver>[1]) => {
       const binding = bindings.get(reference);
       if (!binding || new URL(context.url).origin !== binding.origin || context.headerName.toLowerCase() !== binding.header) {
         throw new Error("HTTP credential binding does not authorize this origin and header");
@@ -69,6 +78,53 @@ export function configuredHttpAccess(env: Readonly<Record<string, string | undef
       return value;
     },
   };
+  return {
+    ...access,
+    /**
+     * Startup assertion for a capability that is about to be registered. A
+     * capability whose credential resolves only at dispatch would let an owner
+     * approve a send or call that can never succeed, so the host proves the
+     * reference, its exact origin/header use, and a non-empty value up front.
+     * Plaintext HTTP is accepted only for an origin the operator declared local.
+     */
+    assertCapabilityCredential: (input: {
+      readonly label: string;
+      readonly secretRef: string;
+      readonly url: string;
+      readonly headerName: string;
+    }): void => {
+      const url = new URL(input.url);
+      // Dispatch refuses a secret header on public plaintext HTTP after DNS
+      // shows the address is not private, so a listed origin is only credible
+      // here when it also names a literal private/loopback host. Otherwise the
+      // daemon would boot a capability whose every send fails at preflight.
+      if (url.protocol === "http:" && !(localOrigins.has(url.origin) && isLiteralPrivateHost(url.hostname))) {
+        throw new Error(`${input.label} must use https unless its origin is a local address listed in OI_HTTP_LOCAL_ORIGINS`);
+      }
+      try {
+        access.resolveSecret(input.secretRef, { url: input.url, headerName: input.headerName, purpose: "mutation" });
+      } catch (cause) {
+        throw new Error(`${input.label} credential binding is not usable at startup`, { cause });
+      }
+    },
+  };
+}
+
+/**
+ * Literal loopback or RFC1918/unique-local address, matching what dispatch will
+ * accept for a plaintext secret-bearing request. A name is deliberately not
+ * accepted — including `localhost`, which is still resolved at request time —
+ * because its address can change between boot and dispatch.
+ */
+function isLiteralPrivateHost(hostname: string): boolean {
+  const host = hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
+  if (host === "::1" || host === "0:0:0:0:0:0:0:1") return true;
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+  if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+  if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+  const octets = /^172\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/.exec(host);
+  if (octets && Number(octets[1]) >= 16 && Number(octets[1]) <= 31) return true;
+  return /^f[cd][0-9a-f]{2}:/i.test(host);
 }
 
 function parseMessageBindings(value: string | undefined): readonly MessageTemplateBinding[] {

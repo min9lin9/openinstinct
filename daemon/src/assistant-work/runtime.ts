@@ -1,11 +1,14 @@
 import type { StateStore } from "../store/db.ts";
-import { FollowupRecoveryService, type AuthoredRecoveryReport } from "./recovery.ts";
+import { FollowupRecoveryService, type AuthoredRecoveryReport, type FollowupRecoveryScope } from "./recovery.ts";
 import { dispatchManagedAction } from "./dispatch.ts";
-import { configuredHttpAccess } from "./http-policy.ts";
+import type { configuredHttpAccess } from "./http-policy.ts";
+import type { AgentEmailIdentity } from "../email/identity.ts";
 import { reconcileManagedAttempt } from "./reconcile.ts";
 
 export class AssistantWorkRuntime {
   private readonly recovery: FollowupRecoveryService;
+  private readonly now: () => string;
+  private readonly startupScope: FollowupRecoveryScope;
   private timer: ReturnType<typeof setInterval> | undefined;
   private running: Promise<void> | undefined;
   private recovered = false;
@@ -17,16 +20,31 @@ export class AssistantWorkRuntime {
     readonly isPaused: () => boolean;
     readonly report: (report: AuthoredRecoveryReport, key: string) => Promise<boolean>;
     readonly onError: (error: unknown) => void;
+    /** Ledger clock; defaults to the wall clock, matching FollowupRecoveryService. */
+    readonly now?: () => string;
+    /**
+     * The host's composed access. Required rather than optional so recovery
+     * uses exactly the policy the daemon booted with; capability actions are
+     * reauthorized through their own capability authorizer (see `agentEmail`).
+     */
+    readonly httpAccess: ReturnType<typeof configuredHttpAccess>;
+    /** Lets recovery reauthorize persisted agent-email actions. */
+    readonly agentEmail?: AgentEmailIdentity;
   }) {
-    const httpAccess = configuredHttpAccess();
+    const httpAccess = options.httpAccess;
+    this.now = options.now ?? (() => new Date().toISOString());
     this.recovery = new FollowupRecoveryService({
       repository: options.store.assistantWork,
       workerId: "assistant-work-runtime",
       dispatch: (action, attemptId, workerId) => dispatchManagedAction({
         repository: options.store.assistantWork, action, attemptId, workerId, httpAccess,
+        now: this.now,
+        ...(options.agentEmail === undefined ? {} : { agentEmail: options.agentEmail }),
       }),
       authoredReport: async () => undefined,
     });
+    // Capture before delayed/paused startup can admit live work owned by other workers.
+    this.startupScope = this.recovery.captureRecoveryScope();
   }
 
   public start(): void {
@@ -54,8 +72,15 @@ export class AssistantWorkRuntime {
   private async drainOnce(): Promise<void> {
     if (this.stopped || this.options.isPaused()) return;
     if (!this.recovered) {
-      await this.recovery.recover();
-      this.recovered = true;
+      try {
+        const results = await this.recovery.recover(this.startupScope);
+        this.recovered = !results.some((result) => result.kind === "recovery_failed");
+        for (const result of results) {
+          if (result.kind === "recovery_failed") this.options.onError(result.error);
+        }
+      } catch (error) {
+        this.options.onError(new Error("Assistant work startup recovery failed", { cause: error }));
+      }
     }
     for (const attempt of this.options.store.assistantWork.listRecoveryCandidates()) {
       if (this.stopped || this.options.isPaused()) return;
@@ -69,7 +94,12 @@ export class AssistantWorkRuntime {
     }
     for (const policy of this.options.store.assistantWork.listFollowupPolicies()) {
       if (this.stopped || this.options.isPaused()) return;
-      if (policy.enabled) await this.recovery.tick(policy.workId);
+      if (!policy.enabled) continue;
+      try {
+        await this.recovery.tick(policy.workId);
+      } catch (error) {
+        this.options.onError(new Error(`Assistant work followup failed for work ${policy.workId} action ${policy.actionId}`, { cause: error }));
+      }
     }
     for (const entry of this.options.store.assistantWork.listPendingFollowupReports()) {
       if (this.stopped || this.options.isPaused()) return;
@@ -81,8 +111,12 @@ export class AssistantWorkRuntime {
         ...(entry.dispatchId === undefined ? {} : { dispatchId: entry.dispatchId }),
         detail: entry.detail,
       };
-      if (await this.options.report(report, entry.id)) {
-        this.options.store.assistantWork.markFollowupReportAdmitted(entry.id, new Date().toISOString());
+      try {
+        if (await this.options.report(report, entry.id)) {
+          this.options.store.assistantWork.markFollowupReportAdmitted(entry.id, new Date().toISOString());
+        }
+      } catch (error) {
+        this.options.onError(new Error(`Assistant work report ${entry.id} failed`, { cause: error }));
       }
     }
   }

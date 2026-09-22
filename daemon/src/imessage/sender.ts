@@ -81,6 +81,16 @@ export class ImessageSender implements DeliveryPort {
     return this.enqueue(() => this.appleScriptSend(handle, { text }));
   }
 
+  /** The guard runs inside the queued slot, immediately before the send. */
+  public sendTextGuarded(handle: string, text: string, guard: () => boolean): Promise<DeliveryReceipt> {
+    return this.enqueue(async () => {
+      if (!guard()) {
+        throw new ImessageSenderError("cli_error", `send guard refused delivery to ${handle}`);
+      }
+      return await this.appleScriptSend(handle, { text });
+    });
+  }
+
   public sendReply(messageGuid: string, _text: string): Promise<DeliveryReceipt> {
     return Promise.reject(new ImessageSenderError("cli_error", `threaded reply is not exposed by the Messages scripting bridge (${messageGuid})`));
   }

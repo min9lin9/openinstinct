@@ -41,7 +41,15 @@ export interface ProposeActionInput extends ActionMaterial {
   /** Stable semantic-effect key within the work. */
   readonly semanticKey: string;
 }
-export type ActionState = "planned" | "approval_pending" | "authorized" | "claimed_pre_effect" | "effect_started" | "confirmed" | "definitive_failed" | "ambiguous" | "cancelled" | "expired" | "blocked";
+export const ACTION_STATES = [
+  "planned", "approval_pending", "authorized", "claimed_pre_effect", "effect_started", "confirmed",
+  "definitive_failed", "ambiguous", "cancelled", "expired", "blocked",
+] as const;
+export type ActionState = typeof ACTION_STATES[number];
+/** A persisted row written by a different binary may carry a state this one cannot interpret. */
+export function isActionState(state: string): state is ActionState {
+  return ACTION_STATES.some((candidate) => candidate === state);
+}
 export interface ActionRecord extends ActionMaterial { readonly id: string; readonly workId: string; readonly semanticKey: string; readonly revision: number; readonly digest: string; readonly state: ActionState; readonly activeAttemptId?: string; readonly cancelledAt?: string; readonly cancelReason?: string; readonly createdAt: string; readonly updatedAt: string }
 
 export interface OwnerRuleMatcher { readonly effectClass: EffectClass; readonly recipient: string; readonly topic: string; readonly action: string }

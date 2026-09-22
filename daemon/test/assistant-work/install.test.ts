@@ -13,6 +13,8 @@ import {
   preflightManagedInstall,
 } from "../../src/assistant-work/install.ts";
 import { stableAttemptId } from "../../src/assistant-work/model.ts";
+import { actionMaterialDigest } from "../../src/assistant-work/model.ts";
+import { priorInstallConfersLocalPolicy } from "../../src/assistant-work/install.ts";
 import { openStateStore } from "../../src/store/db.ts";
 
 const roots: string[] = [];
@@ -665,4 +667,36 @@ describe("managed user-local Bun installation", () => {
       store.close();
     }
   });
+
+describe("prior install local-policy authority", () => {
+  const base = () => ({
+    id: "aw:action:prior", workId: "work", semanticKey: "prior", revision: 1,
+    state: "confirmed", effectClass: "ordinary_local_install",
+    recipient: "bun", topic: "install", action: MANAGED_INSTALL_ACTION,
+    payload: { destination: "/tmp/x", packageSpec: "bun@1.0.0" },
+    scope: null, cost: null, deadlineAt: undefined,
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z",
+  });
+  // An action whose stored digest MATCHES its material, so the only thing left
+  // to decide authority is the confirmation's integrity.
+  const intact = () => { const action = base() as never as Record<string, unknown>; action.digest = actionMaterialDigest(action as never); return action as never; };
+  const confirming = [{ state: "confirmed", outcome: { ok: true } }] as never;
+  const flagged = [{ state: "confirmed", outcome: { materialIntegrityViolation: true, outcome: { ok: true } } }] as never;
+
+  test("a confirmed install with intact material and an unflagged confirmation confers authority", () => {
+    expect(priorInstallConfersLocalPolicy(intact(), confirming)).toBe(true);
+  });
+
+  test("a confirmation recorded against altered material confers no authority", () => {
+    // Same action, same matching digest: only the settlement's integrity differs.
+    expect(priorInstallConfersLocalPolicy(intact(), flagged)).toBe(false);
+    expect(priorInstallConfersLocalPolicy(intact(), [])).toBe(false);
+    // A rewritten material no longer matching its stored digest also fails.
+    const rewritten = intact() as never as Record<string, unknown>;
+    rewritten.payload = { destination: "/tmp/evil", packageSpec: "bun@1.0.0" };
+    expect(priorInstallConfersLocalPolicy(rewritten as never, confirming)).toBe(false);
+    expect(priorInstallConfersLocalPolicy({ ...(intact() as object), state: "authorized" } as never, confirming)).toBe(false);
+    expect(priorInstallConfersLocalPolicy({ ...(intact() as object), action: "managed_http_request" } as never, confirming)).toBe(false);
+  });
+});
 });

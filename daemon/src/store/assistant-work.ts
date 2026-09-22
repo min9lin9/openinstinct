@@ -1,8 +1,10 @@
 import type { Database } from "bun:sqlite";
 
+import { PEER_COORDINATION_ACTION } from "../peers/coordination.ts";
 import {
   actionMaterialDigest,
   authorizationRequirementForEffect,
+  isActionState,
   canonicalJson,
   ownerRuleCanAuthorize,
   stableActionId,
@@ -98,7 +100,7 @@ interface ActionRow {
   readonly semantic_key: string;
   readonly current_revision: number;
   readonly current_digest: string;
-  readonly state: ActionState;
+  readonly state: string;
   readonly active_attempt_id: string | null;
   readonly cancelled_at: string | null;
   readonly cancel_reason: string | null;
@@ -357,6 +359,21 @@ export interface AssistantWorkRepository {
     input: { readonly actionId: string; readonly revision: number; readonly digest: string; readonly reason: string },
     now: string,
   ): ActionRecord;
+  /**
+   * Cancels an action only while the named attempt is still this worker's
+   * `claimed_pre_effect` claim, checked in the same transaction as the write.
+   */
+  releaseClaimedPreEffectAttempt(
+    input: {
+      readonly actionId: string;
+      readonly revision: number;
+      readonly digest: string;
+      readonly attemptId: string;
+      readonly workerId: string;
+      readonly reason: string;
+    },
+    now: string,
+  ): { readonly released: boolean; readonly action: ActionRecord };
 
   setOwnerRule(input: SetOwnerRuleInput, now: string): OwnerRuleRecord;
   getOwnerRule(id: string): OwnerRuleRecord | undefined;
@@ -649,6 +666,68 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
     ).all(...(workId === undefined ? [] : [workId])) as ActionRow[]).map(toActionRecord);
   }
 
+  /**
+   * Releases a claim this worker owns, atomically. The expected attempt and
+   * worker are part of the same transaction as the cancellation, so a takeover
+   * landing between a caller's check and its cancel can no longer cause one
+   * worker to cancel another worker's live attempt. Returns `released: false`
+   * when the claim is no longer ours to release.
+   */
+  public releaseClaimedPreEffectAttempt(
+    input: {
+      readonly actionId: string;
+      readonly revision: number;
+      readonly digest: string;
+      readonly attemptId: string;
+      readonly workerId: string;
+      readonly reason: string;
+    },
+    now: string,
+  ): { readonly released: boolean; readonly action: ActionRecord } {
+    assertNonEmpty(input.actionId, "release actionId");
+    assertPositiveInteger(input.revision, "release action revision");
+    assertDigest(input.digest, "release action digest");
+    assertNonEmpty(input.attemptId, "release attemptId");
+    assertNonEmpty(input.workerId, "release workerId");
+    assertNonEmpty(input.reason, "release reason");
+    assertTimestamp(now, "release now");
+
+    return this.transaction("releaseClaimedPreEffectAttempt", () => {
+      const action = this.getRequiredAction(input.actionId);
+      const attempt = this.getAttempt(input.attemptId);
+      if (
+        action.revision !== input.revision
+        || action.digest !== input.digest
+        || action.activeAttemptId !== input.attemptId
+        || attempt === undefined
+        || attempt.state !== "claimed_pre_effect"
+        || attempt.workerId !== input.workerId
+      ) {
+        // Someone else moved on: leave their claim alone.
+        return { released: false, action };
+      }
+      const cancelledAttempts = this.db.query(
+        `UPDATE assistant_work_attempts
+         SET state = 'cancelled', settled_at = ?, outcome_json = ?, updated_at = ?
+         WHERE id = ? AND state = 'claimed_pre_effect' AND worker_id = ?`,
+      ).run(now, canonicalJson({ reason: input.reason }), now, input.attemptId, input.workerId);
+      if (cancelledAttempts.changes === 0) {
+        return { released: false, action };
+      }
+      // Fenced on the attempt this call cancelled: a cancel racing an effect
+      // start must not leave the action cancelled with an effect_started
+      // attempt, which would lose that attempt's outcome.
+      this.db.query(
+        `UPDATE assistant_work_actions
+         SET state = 'cancelled', cancelled_at = ?, cancel_reason = ?, updated_at = ?
+         WHERE id = ? AND current_revision = ? AND current_digest = ?
+           AND active_attempt_id IS ?`,
+      ).run(now, input.reason, now, action.id, action.revision, action.digest, action.activeAttemptId ?? null);
+      this.invalidateActiveApprovals(action.id, now);
+      return { released: true, action: this.getRequiredAction(action.id) };
+    });
+  }
+
   public cancelAction(
     input: { readonly actionId: string; readonly revision: number; readonly digest: string; readonly reason: string },
     now: string,
@@ -676,11 +755,15 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
            WHERE id = ? AND state = 'claimed_pre_effect'`,
         ).run(now, canonicalJson({ reason: input.reason }), now, action.activeAttemptId);
       }
+      // Fenced on the attempt this call cancelled: a cancel racing an effect
+      // start must not leave the action cancelled with an effect_started
+      // attempt, which would lose that attempt's outcome.
       this.db.query(
         `UPDATE assistant_work_actions
          SET state = 'cancelled', cancelled_at = ?, cancel_reason = ?, updated_at = ?
-         WHERE id = ? AND current_revision = ? AND current_digest = ?`,
-      ).run(now, input.reason, now, action.id, action.revision, action.digest);
+         WHERE id = ? AND current_revision = ? AND current_digest = ?
+           AND active_attempt_id IS ?`,
+      ).run(now, input.reason, now, action.id, action.revision, action.digest, action.activeAttemptId ?? null);
       this.db.query(
         `UPDATE assistant_work_explicit_approvals
          SET state = 'invalidated', invalidated_at = ?, updated_at = ?
@@ -909,9 +992,21 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
           priorAttempt.state === "claimed_pre_effect"
           && action?.revision === input.revision
           && action.digest === input.digest
+          && actionMaterialDigest(action) === action.digest
           && action.activeAttemptId === priorAttempt.id
         ) {
           return { kind: "claimed", resumed: true, action, attempt: priorAttempt };
+        }
+        // A resumed claim whose stored digest no longer describes its material
+        // must say so: falling through would report `already_claimed`, which
+        // points an operator at the attempt instead of the rewritten action.
+        if (
+          action !== undefined
+          && action.revision === input.revision
+          && action.digest === input.digest
+          && actionMaterialDigest(action) !== action.digest
+        ) {
+          return rejectedClaim("stale_digest", action, priorAttempt);
         }
         return rejectedClaim(rejectionForAttempt(priorAttempt.state), action, priorAttempt);
       }
@@ -924,6 +1019,14 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
         return rejectedClaim("stale_revision", action);
       }
       if (action.digest !== input.digest) {
+        return rejectedClaim("stale_digest", action);
+      }
+      // The stored digest is only a label: recompute it from the material that
+      // will actually be dispatched, so a row-level edit after approval cannot
+      // ride the original approval. Without this, an approved action's payload
+      // or scope can be rewritten and still execute — for an irreversible
+      // billable effect that is an unauthorized call with a false confirmation.
+      if (actionMaterialDigest(action) !== action.digest) {
         return rejectedClaim("stale_digest", action);
       }
 
@@ -1080,6 +1183,11 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
       evidence: input.evidence,
     });
     return this.transaction("resolveAmbiguousAttempt", () => {
+      // Resolving an ambiguity is a decision, not a record of something that
+      // happened, so it must not be made about material that no longer matches
+      // what the owner approved. Checked inside the transaction so the decision
+      // and the integrity it rests on cannot be separated by a concurrent write.
+      this.assertActionMaterialIntact(input.attemptId);
       const attempt = this.getRequiredAttempt(input.attemptId);
       if (attempt.state === input.resolution) {
         if (nullableJson(attempt.outcome) !== evidenceJson) {
@@ -1260,6 +1368,14 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
       if (action.workId !== input.workId) {
         throw new Error("followup policy action does not belong to work");
       }
+      // A repeat dispatch copies the persisted payload verbatim, so a capability
+      // action whose provider correlation is bound to this one action would have
+      // its later repeats confirmed by the first one's provider status. Until
+      // repeats re-materialize their own correlated payload, refuse the policy
+      // rather than schedule an effect that can report a false success.
+      if (isCorrelatedCapabilityAction(action)) {
+        throw new Error(`followup policies are not supported for correlated capability actions: ${action.id}`);
+      }
       const existing = this.getFollowupPolicy(input.workId);
       if (
         existing
@@ -1364,6 +1480,20 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
         this.clearFollowupDue(policy, now);
         return { kind: "none", reason: "policy_changed", policy, action: originalAction };
       }
+      // A repeat copies the source's material into a freshly hashed action, so
+      // a rewritten source would be re-legitimized under a new digest the owner
+      // never saw. Recompute before materializing anything from it.
+      if (actionMaterialDigest(originalAction) !== originalAction.digest) {
+        this.clearFollowupDue(policy, now);
+        return { kind: "none", reason: "policy_changed", policy, action: originalAction };
+      }
+      // Correlated capability actions are refused a repeat at creation; a policy
+      // that predates that fence must not be honoured either, or a copied
+      // payload would be confirmed by the original effect's provider status.
+      if (isCorrelatedCapabilityAction(originalAction)) {
+        this.clearFollowupDue(policy, now);
+        return { kind: "none", reason: "policy_changed", policy, action: originalAction };
+      }
       if (originalAction.state === "planned" || originalAction.state === "approval_pending" || originalAction.state === "authorized") {
         return { kind: "none", reason: "source_unconfirmed", policy, action: originalAction };
       }
@@ -1373,6 +1503,15 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
       }
       if (originalAction.state === "claimed_pre_effect" || originalAction.state === "effect_started") {
         return { kind: "none", reason: "active_effect", policy, action: originalAction };
+      }
+      // The repeat copies the source's material into a freshly hashed action, so
+      // a source whose confirmation was recorded against rewritten material must
+      // not seed one — restoring the payload afterwards does not un-ring that
+      // bell, and the copied effect would inherit an unusable receipt.
+      if (!this.listAttempts(originalAction.id)
+        .some((attempt) => attempt.state === "confirmed" && !hasMaterialIntegrityViolation(attempt.outcome))) {
+        this.clearFollowupDue(policy, now);
+        return { kind: "none", reason: "source_unconfirmed", policy, action: originalAction };
       }
       if (originalAction.state === "ambiguous") {
         this.clearFollowupDue(policy, now);
@@ -2299,6 +2438,26 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
     });
   }
 
+  /**
+   * Refuses to record an outcome for an attempt whose action material no longer
+   * hashes to its approved digest: settling a rewritten action would attach a
+   * real-world result to something the owner never authorized.
+   */
+  private assertActionMaterialIntact(attemptId: string): void {
+    if (!this.materialIntact(attemptId)) {
+      const attempt = this.getAttempt(attemptId);
+      throw new Error(`action material no longer matches its approved digest: ${attempt?.actionId ?? attemptId}`);
+    }
+  }
+
+  /** False when the attempt's action no longer hashes to its approved digest. */
+  private materialIntact(attemptId: string): boolean {
+    const attempt = this.getAttempt(attemptId);
+    if (attempt === undefined) return true;
+    const action = this.getAction(attempt.actionId);
+    return action === undefined || actionMaterialDigest(action) === action.digest;
+  }
+
   private settleAttempt(
     input: SettleAttemptInput,
     state: Extract<AttemptState, "confirmed" | "definitive_failed" | "ambiguous">,
@@ -2306,11 +2465,20 @@ class SqliteAssistantWorkRepository implements AssistantWorkRepository {
   ): AttemptTransitionRecord {
     assertAttemptTransitionInput(input);
     assertTimestamp(now, "attempt settlement now");
-    const outcomeJson = canonicalJson(input.outcome);
-
     return this.transaction(`settleAttempt:${state}`, () => {
       const attempt = this.getRequiredAttempt(input.attemptId);
       assertAttemptWorker(attempt, input.workerId);
+      // A settlement records something that already happened in the world, so it
+      // must not be refused when the stored material was altered mid-flight —
+      // that would lose the outcome. Record it, and mark the ledger entry so the
+      // record cannot be mistaken for one matching the approved material.
+      //
+      // Evaluated inside the transaction: a pre-transaction check could be raced
+      // by a rewrite landing between the check and this write, which would
+      // persist an unmarked outcome for altered material.
+      const outcomeJson = canonicalJson(this.materialIntact(input.attemptId)
+        ? input.outcome
+        : withMaterialIntegrityViolation(input.outcome));
       if (attempt.state === state) {
         if (nullableJson(attempt.outcome) !== outcomeJson) {
           throw new Error(`attempt settlement replay changed its outcome: ${attempt.id}`);
@@ -2527,14 +2695,75 @@ function toObservationRecord(row: ObservationRow): ObservationRecord {
   };
 }
 
+/**
+ * Wraps an outcome recorded against material that no longer matches its
+ * approved digest. The receipt is always nested under `outcome` rather than
+ * merged, so the marker can never collide with or overwrite a field the
+ * executor produced, and consumers see one shape regardless of outcome type.
+ *
+ * Exported so the recovery layer builds the same receipt rather than a second
+ * literal that could drift from this one.
+ */
+export function withMaterialIntegrityViolation(outcome: JsonValue): JsonValue {
+  return { materialIntegrityViolation: true, outcome };
+}
+
+/** True when a settlement was recorded against material that no longer matched. */
+export function hasMaterialIntegrityViolation(outcome: JsonValue | undefined): boolean {
+  return outcome !== undefined
+    && outcome !== null
+    && typeof outcome === "object"
+    && !Array.isArray(outcome)
+    && (outcome as { readonly materialIntegrityViolation?: unknown }).materialIntegrityViolation === true;
+}
+
+/**
+ * True when an action must not be repeated: agent email, agent calls, and peer
+ * envelopes. Email and calls bind verification to one client reference, so a
+ * repeat that reused the payload could be confirmed by the original effect's
+ * provider status; a peer envelope carries a single-use nonce and has no repeat
+ * executor. Email/call detection is by the capability's own body shape rather
+ * than the mere presence of a `clientReference`, so unrelated managed HTTP work
+ * is unaffected.
+ */
+function isCorrelatedCapabilityAction(action: ActionRecord): boolean {
+  // A peer envelope carries a single-use nonce and is delivered by the peer
+  // lane, which has no repeat executor: a policy would be accepted and then
+  // cancelled when due, and a copied envelope would reuse its nonce.
+  if (action.action === PEER_COORDINATION_ACTION) return true;
+  const payload = action.payload;
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return false;
+  const body = (payload as { readonly body?: unknown }).body;
+  if (typeof body !== "string") return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return false;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  // Containment, not an exact key set: an extra field must not disable the
+  // fence, and requiring the whole capability field set alongside the
+  // correlation reference keeps unrelated managed HTTP work unaffected.
+  const keys = new Set(Object.keys(parsed as Record<string, unknown>));
+  if (!keys.has("clientReference")) return false;
+  const hasAll = (required: readonly string[]) => required.every((key) => keys.has(key));
+  return hasAll(["from", "to", "subject", "text"])
+    || hasAll(["from", "to", "purpose", "script", "maxMinutes"]);
+}
+
 function toActionRecord(row: ActionRow): ActionRecord {
+  const state = row.state;
+  if (!isActionState(state)) {
+    throw new Error(`unsupported assistant action state ${state}: action ${row.id}, work ${row.work_id}, revision ${row.current_revision}, digest ${row.current_digest}`);
+  }
   return {
     id: row.id,
     workId: row.work_id,
     semanticKey: row.semantic_key,
     revision: row.current_revision,
     digest: row.current_digest,
-    state: row.state,
+    state,
     effectClass: row.effect_class,
     ...(row.recipient === null ? {} : { recipient: row.recipient }),
     ...(row.topic === null ? {} : { topic: row.topic }),

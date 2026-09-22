@@ -133,6 +133,64 @@ live child 캡은 대화형과 모니터 자식을 모두 세며 모니터 우�
 모든 `children.*` 제한값은 재시작 범위다. 패널은 `*Ms` 키에 밀리초를 써서 저장한 뒤
 가재를 재시작하며, 직접 config를 고친 경우에도 데몬을 재시작해야 한다.
 
+## 에이전트 이메일, 상대 협조, 외부 통화
+
+세 기능 모두 설정하지 않으면 꺼져 있다. 아래 값은 데몬의 비공개 `~/.openinstinct/env` 파일(`KEY=value`, mode 0600)에 넣고 데몬 시작 시 읽는다. 프롬프트나 패널에서는 설정할 수 없다.
+
+### 에이전트 자신의 이메일 주소
+
+```
+OI_AGENT_EMAIL_ADDRESS=gajae@yourdomain.example
+OI_AGENT_EMAIL_SEND_ORIGIN=https://api.mailprovider.example
+OI_AGENT_EMAIL_SEND_PATH=/v1/send
+OI_AGENT_EMAIL_INBOX_URL=https://api.mailprovider.example/v1/inbox
+OI_AGENT_EMAIL_SECRET_REF=secret://agent-mail
+OI_HTTP_SECRET_BINDINGS={"secret://agent-mail":{"origin":"https://api.mailprovider.example","header":"Authorization","environment":"AGENT_MAIL_TOKEN"}}
+AGENT_MAIL_TOKEN=<provider api token>
+```
+
+**필수 provider 계약.** 발송 endpoint는 정확히 `{clientReference, from, to, subject, text}` JSON 본문을 받고 `GET <send path>?clientReference=<ref>`는 **실제로 접수된 경우에만** `acceptedReference`에 같은 reference를 넣어 돌려줘야 한다. 이 한 필드가 상관관계와 성공을 함께 나른다. 일반적인 `{"accepted":true}`는 *이* 메일에 대해 아무것도 증명하지 못하고, 실패 응답 옆에 reference만 echo되면 보내지지도 않은 메일이 확정될 수 있기 때문이다. 그 외에는 모두 `ambiguous`로 남는다. 이 계약을 구현한 adapter를 가리키게 설정한다.
+
+`OI_AGENT_EMAIL_ADDRESS`만 있으면 `agent_email` 툴이 켜진다. 주소가 있는데 다른 필드가 빠지거나 잘못되면 반쯤 설정된 신원으로 발송하지 않고 데몬이 시작에 실패한다. 자격 증명 binding도 시작 시 검사한다: `OI_HTTP_SECRET_BINDINGS` 항목 누락, 다른 origin/header를 가리키는 binding, 빈 토큰, `OI_HTTP_LOCAL_ORIGINS`에 등록되고 동시에 literal loopback이나 사설 주소인 경우가 아닌 평문 `http://` origin은 모두 부팅을 중단시킨다. 등록된 DNS 이름도 평문이면 거부한다 — dispatch는 요청 시점에 해석된 주소로 판단하고 그 주소는 바뀔 수 있기 때문이다 — 소유자가 승인한 뒤에 실패하지 않게 하기 위해서다. 이 기능에는 message binding을 쓰지 않는다: agent_email 툴은 신원으로부터 바이트 단위로 다시 만들 수 있는 plan만 인가하며 `OI_HTTP_MESSAGE_BINDINGS`에 email 템플릿을 추가하지 않으므로, `assistant_managed_http`가 스스로 구성한 요청으로 agent-email 분류를 얻을 수 없다. 운영자는 자격 증명 binding만 제공하므로 토큰이 프롬프트, URL, 액션 payload에 실리지 않는다.
+
+메일 본문도 managed HTTP의 평문 자격 증명 휴리스틱을 거친다. 리터럴 비밀이 들어 있는 것처럼 보이는 본문은 액션이 저장되기 전에 거부되므로, 토큰이나 비밀번호처럼 보이는 문자열을 인용한 메일은 발송되지 않는다. 자격 증명은 요청 본문이 아니라 `secret://` reference에 있어야 하므로 의도된 동작이지만, 정상적인 문장이 거부될 수도 있다. 우회하지 말고 표현을 바꾼다.
+
+발송은 `external_message` 액션이다. 먼저 제안하고, 정확한 액션 ID/revision/digest로만 실행하며, 해당 수신자와 제목에 대한 정확한 `/allow-send` 규칙이나 `/approve`로 인가한다. 받은 메일은 third-party 증거로만 admit되어 작업을 열 수는 있어도 액션을 인가하지 못한다.
+
+### 신뢰할 수 있는 상대
+
+상대 협조에는 env 설정이 없다. 허용 목록은 `trusted_peers` 테이블에 있고 항목을 넣기 전까지 비어 있으므로 기능은 기본적으로 비활성이며, `peer_coordinate` 툴은 수신자를 추측하지 않고 그 사실을 보고한다.
+
+등록과 취소는 신뢰 경계를 바꾸므로 모델 툴이 아니라 control socket의 운영자 작업이다:
+
+```
+peers.list    {}
+peers.upsert  {"handle":"+15550000002","displayName":"Alex","relation":"household"}
+peers.revoke  {"handle":"+15550000002"}
+```
+
+`relation`은 `household`, `colleague`, `professional`, `business` 중 하나다. 핸들은 소유자 허용 목록과 동일한 규칙으로 정규화되므로 신뢰 판정과 조회가 같은 상대를 본다. 취소는 기록과 이력을 남기되 즉시 admission을 멈추고, 이미 승인된 발신 envelope도 멈춘다 — 신뢰는 제안 시점이 아니라 전송 경계에서 다시 확인한다. 소유자가 아닌 iMessage 행은 절대 소유자 턴이 되지 않는다: `trusted` 상태 상대의 협조 envelope 하나로 admit되거나, 나머지 비소유자 행과 함께 `allowlist_dropped`로 버려진다. admit은 `peers/envelope_admitted`로 기록되고, 취소된 상대는 기록을 지우지 않은 채 무시된다. peer envelope은 일회용 nonce를 갖고 관리형 dispatcher에는 peer 반복 executor가 없으므로 `/followup` 반복 정책은 거부된다. 반복되는 약속은 매번 새 제안으로 만든다. 검증이 하나의 correlation reference에 묶인 agent email과 agent call에도 같은 거부가 적용된다.
+
+원장은 액션의 material을 소유자가 승인한 digest에 묶는다. dispatch claim과 resume 시점에 digest를 다시 계산하고, 불일치하면 `stale_digest`로 거부한다. 반복을 구체화하기 전에도 다시 계산하며(이때는 due 표시를 지우고 `policy_changed`를 보고한다), ambiguity 해소 전에도 다시 계산해 해소 자체를 거부한다. 승인 후 편집된 액션은 그 승인으로 실행될 수 없다는 뜻이다. material이 일치하지 않는 상태에서 기록되는 정산은 (효과가 이미 발생했으므로) 저장하되 `materialIntegrityViolation`으로 표시하며, 그런 확정은 작업 완료 근거가 되거나 이후 설치의 권한을 넓히지 못한다. 크래시로 `claimed_pre_effect`에 남은 시도는 dispatch가 거부되든 executor가 효과 시작 전에 throw하든 영원히 재시도하지 않고 취소되므로, 다시 제안하면 된다.
+
+### 외부 통화 (Concierge 대응)
+
+```
+OI_AGENT_CALL_ORIGIN=https://api.telephony.example
+OI_AGENT_CALL_CREATE_PATH=/v1/calls
+OI_AGENT_CALL_STATUS_PATH=/v1/calls/status
+OI_AGENT_CALL_CALLER_ID=+15550000001
+OI_AGENT_CALL_SECRET_REF=secret://agent-calls
+OI_HTTP_SECRET_BINDINGS={"secret://agent-calls":{"origin":"https://api.telephony.example","header":"Authorization","environment":"AGENT_CALL_TOKEN"}}
+AGENT_CALL_TOKEN=<provider api token>
+```
+
+**필수 provider 계약.** 생성 endpoint는 정확히 `{clientReference, from, to, purpose, script, maxMinutes}` 본문을 받아야 하고, `GET <status path>?clientReference=<ref>`는 **그 통화가 실제로 발신된 경우에만** `placedReference`에 같은 reference를 넣어 돌려줘야 한다. `{"status":"placed"}`만 주는 상태 endpoint로는 절대 확인되지 않는다. 다른 통화의 placed 상태가 과금되는 이 통화를 잘못 확정할 수 있고, 상관관계가 맞더라도 `not_placed`라면 확정해서는 안 되기 때문이다. 일치하지 않거나 실패했거나 오래된 응답은 `ambiguous`로 정산된다.
+
+`OI_AGENT_CALL_ORIGIN`만 있으면 `agent_call` 툴이 켜지고, 일부만 설정하면 시작에 실패한다. 생성 endpoint에 대해 풀리지 않는 자격 증명 binding이나 로컬이 아닌 평문 `http://` origin도 마찬가지다. 모든 통화는 `external_mutation`이므로 해당 identity를 지목한 인증된 `/approve`가 항상 필요하다 — send 규칙으로는 구조적으로 통화를 인가할 수 없다. 제안에는 수신자, 목적, 스크립트, 분 상한(1–30)이 담겨 승인 화면에서 읽힌다. provider 5xx는 두 번째 시도 없이 `definitive_failed`, 응답 없음은 `ambiguous`로 `uncertain`으로 보고되고 자동 재시도하지 않는다. 그런 통화는 다시 제안하기 전에 provider의 통화 기록과 대조한다.
+
+`OI_HTTP_SECRET_BINDINGS`는 객체 하나에 모든 reference를 담으므로, 메일과 통신 항목은 변수를 두 번 쓰지 말고 하나의 JSON 객체로 합친다.
+
 ## 가재 전용 Chrome 프로파일
 
 브라우저 툴은 소유자의 개인 Chrome을 절대 건드리지 않음. 모든 브라우저 호출은 `app.browser = "chrome"`, `user_data_dir = ~/.openinstinct/chrome-profile`에 고정됨(런타임 프롬프트 + 익스텐션 강제): CDP 포트로 뜨는 전용 영구 프로파일(Chrome 136+는 비기본 데이터 디렉토리에서만 허용). 패널의 "Open Gajae's browser"(소켓 `browser.open`)로 그 프로파일을 눈에 보이게 열고, 가재가 쓸 사이트에 로그인하고 창을 닫음 — 로그인이 유지되고 내 세션과 격리되어 토큰 회전 사이트(카카오, 은행)가 나를 로그아웃시키지 않음. 프롬프트는 순차 작업에 탭 하나("main")를 재사용하도록 고정.
@@ -246,17 +304,29 @@ bun scripts/soak/soak-monitor.ts --hours 24
 
 ## 라이브 인수 절차
 
-TCC를 부여하고 두 번째 iMessage 번호를 준비한 뒤:
+TCC 권한을 부여하고 소유자 iMessage 핸들을 연결하고 패널을 빌드한 뒤, 새 토큰을 정해 하네스가 기다리는 동안 허용 목록의 소유자 기기에서 보내세요. `OI_ACCEPTANCE_SECOND_HANDLE`은 별개의 낯선 계정이 아니라 그 허용된 발신자여야 합니다.
 
 ```sh
 OI_ACCEPTANCE_SECOND_HANDLE='+821000000002' \
-OI_ACCEPTANCE_SEND=1 \
+OI_ACCEPTANCE_INBOUND_TOKEN='unique-token-for-this-run' \
 bun scripts/acceptance/run-acceptance.ts
 ```
 
-하네스는 `AC-1`~`AC-10`, 증거 줄, `METRIC acceptance_pass=<n>/10`을 출력. 전제가 없으면 절대 통과로 치지 않음. 권한·빌드된 패널·두 번째 기기·명시적 모니터·알려진 자식 id가 필요한 시나리오는 `SKIP(reason)`.
+하네스는 `AC-1`~`AC-11`, 증거 줄, `METRIC acceptance_pass=<n>/11`을 출력합니다. 전제가 없으면 `SKIP`이며 통과가 아닙니다. 관측된 영수증·동작 실패는 `FAIL`로 남습니다. 위 명령은 모니터 토글이나 데몬 재시작을 허가하지 않습니다. `--wait-seconds N`, `--socket PATH`, `--home PATH`, `--panel-app PATH`로 대상 인스턴스와 대기 시간을 명시하세요.
 
-AC-7은 잠시 토글해도 되는 모니터를 `OI_ACCEPTANCE_MONITOR_ID=<id>`로; 하네스가 원상복구. AC-8은 고유 토큰을 `OI_ACCEPTANCE_INBOUND_TOKEN=<token>`으로 두고 하네스가 기다리는 동안 두 번째 기기에서 정확히 그 토큰을 보냄. AC-9는 실제 소유자 채팅에서 백그라운드 작업을 만들게 한 뒤 admit 후 `OI_ACCEPTANCE_CHILD_ID=<child-id>`. `--wait-seconds N`, `--socket PATH`, `--home PATH`, `--panel-app PATH`로 대상 인스턴스를 명시.
+- **AC-1 — 소유자 왕복:** 위 발신자 핸들과 인바운드 토큰, `chat.db` 접근 권한, 연결된 소유자 핸들, 해당 인바운드 메시지의 confirmed 응답 원장 항목이 필요합니다.
+- **AC-2 — 백그라운드 위임:** 소유자 채팅에서 작업을 위임하고 첫 턴이 idle/cold 또는 종결 상태로 안정되며 첫 영수증이 delivered가 된 뒤 `OI_ACCEPTANCE_CHILD_ID=<child-id>`를 지정합니다. admit만으로는 부족합니다.
+- **AC-3 — 예약 모니터 전달:** 소유자 채팅에서 cron 모니터를 작성하고 예약에 따라 발화하게 한 뒤 `OI_ACCEPTANCE_MONITOR_ID=<id>`로 디스패치·전달 증거를 확인합니다. 데몬이 기본 생성한 모니터는 이 기준을 충족하지 않습니다.
+- **AC-4 — 메모리 생명주기:** 기존 메모리 코퍼스, Git 영수증, 구조 감사를 확인합니다. 재시작 후 메모리 보존은 AC-6에서 추가로 확인합니다.
+- **AC-5 — 패널 감독:** 설치된 패널 실행 파일, 데몬 상태, 활성 자식 수, 모니터 목록을 확인합니다. `OI_ACCEPTANCE_MONITOR_ID=<id>`를 설정하면 그 모니터를 리비전 펜싱으로 토글하고 원상복구하는 작업을 명시적으로 허가합니다. 잠시 토글해도 안전한 비보호 모니터를 선택하세요. 같은 변수가 AC-3의 증거 대상도 선택합니다. 보호된 선택은 변경 전에 실패합니다. 선택하지 않았거나 선택한 모니터가 없으면 부분적인 상태·패널 증거와 함께 `SKIP`을 출력하며 토글 검증을 통과했다고 하지 않습니다. 목록 조회는 성공한 토글이나 패널 UI 조작의 증거가 아닙니다.
+- **AC-6 — 재시작 재개:** `OI_ACCEPTANCE_RESTART=1`은 실행 중인 데몬을 종료·재기동하여 기존 메인 세션 재개를 확인하는 작업을 허가합니다.
+- **AC-7 — 보이는 턴 실패:** 기존 confirmed `[turn failed]` 응답을 확인합니다. 하네스가 직접 장시간 실행이나 차단된 턴을 유발하지는 않습니다.
+- **AC-8 — 스레드 응답:** 기존 confirmed 응답 연결 전달을 `chat.db`의 실제 스레드 배치와 대조합니다. 합성 AppleScript 메시지 id를 포함해 원장 영수증만으로는 스레드 배치를 입증하지 못합니다.
+- **AC-9 — 양방향 이미지:** 가장 최근의 해당 소유자 이미지에 confirmed 턴 응답이 있는지, 기존 비강등 outbound 파일 전달이 있는지 확인합니다. 미리 소유자 이미지를 보내고 이미지를 보내 달라고 요청하세요. 이 시나리오는 트래픽을 생성하거나 누락된 이미지 응답을 기다리지 않습니다.
+- **AC-10 — 낯선 발신자 침묵:** 데몬의 처리 완료 커서 범위 안에 있는 기존 비허용 인바운드 트래픽에 응답·턴 증거가 없는지 확인합니다.
+- **AC-11 — 대화형 자식:** `OI_ACCEPTANCE_CHILD_ID`, 고유한 `OI_ACCEPTANCE_TOKEN`, `OI_ACCEPTANCE_RESTART=1`이 필요합니다. 첫 영수증이 delivered이고 nudge 턴을 완료했으며 세션 프롬프트 해시 증거와 해당 토큰이 담긴 영속 `report_progress`가 있는 idle/cold 자식을 준비하세요. SIGKILL 전에 미전달 중간 보고 구간을 관측할 수 있도록 다시 보고하게 합니다. 재시작 후 소유자 기기에서 토큰을 보내 그 자식을 nudge·재개하면 하네스가 새 토큰 포함 턴을 확인합니다. 선택적인 `OI_ACCEPTANCE_ORPHAN=1` 분기는 대신 자식의 영속 세션 파일을 삭제해 orphan 복구를 검증합니다. 이는 파괴적 작업이며 일반적인 전제가 아닙니다.
+
+이 하네스는 여러 종류의 증거를 함께 확인하며, 11개의 새 종단 간 상호작용을 모두 생성하는 도구가 아닙니다. 특히 AC-7/8/9는 배포 시각이나 실행 토큰 경계 없이 과거 기록을 확인하므로 배포 후 실행했다는 사실만으로 새 배포 버전의 동작을 입증하지 못합니다. AC-1도 기존 메시지에서 토큰을 찾으므로 실제 새 토큰을 사용하고 배포 후 인바운드·응답 증거를 연계해야 새 라이브 테스트가 됩니다. AC-2/3은 준비된 과거 자식·모니터 증거가 필요합니다. AC-6/11은 명시적으로 허가했을 때만 실제 재시작 작업을 수행합니다. 실패와 누락된 영수증을 보존하고 과거 성공을 새 배포 검증으로 바꿔 부르지 마세요.
 
 ## 메모리 격리 복구
 

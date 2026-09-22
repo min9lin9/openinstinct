@@ -7,6 +7,7 @@ public enum ControlTransportError: Error, LocalizedError, Sendable {
     case missingNegotiation
     case unsupportedCapability(ControlCapability)
     case unexpectedFrame
+    case timedOut
 
     public var errorDescription: String? {
         switch self {
@@ -20,6 +21,8 @@ public enum ControlTransportError: Error, LocalizedError, Sendable {
             return "The daemon does not support \(capability.rawValue)."
         case .unexpectedFrame:
             return "The daemon returned an unexpected control frame."
+        case .timedOut:
+            return "The openinstinct operation timed out. The daemon may still be running."
         }
     }
 }
@@ -48,6 +51,47 @@ public protocol ControlTransport: Sendable {
     func subscribe() async throws -> ChatSubscription
 }
 
+/// Unlike a task-group race, this deadline does not wait for an uncooperative
+/// operation to finish after cancellation. Late results are discarded.
+func boundedControlOperation<Value: Sendable>(
+    timeout: UInt64,
+    operation: @escaping @Sendable () async throws -> Value
+) async throws -> Value {
+    try Task.checkCancellation()
+    let results = AsyncThrowingStream<Value, Error> { continuation in
+        let worker = Task {
+            do {
+                try Task.checkCancellation()
+                let value = try await operation()
+                try Task.checkCancellation()
+                continuation.yield(value)
+                continuation.finish()
+            } catch {
+                continuation.finish(throwing: error)
+            }
+        }
+        let deadline = Task {
+            do {
+                try await Task.sleep(nanoseconds: timeout)
+                continuation.finish(throwing: ControlTransportError.timedOut)
+            } catch {}
+        }
+        continuation.onTermination = { _ in
+            worker.cancel()
+            deadline.cancel()
+        }
+    }
+    var iterator = results.makeAsyncIterator()
+    do {
+        guard let value = try await iterator.next() else { throw CancellationError() }
+        try Task.checkCancellation()
+        return value
+    } catch {
+        try Task.checkCancellation()
+        throw error
+    }
+}
+
 public actor UnixSocketTransport: ControlTransport {
     /// `OI_CONTROL_SOCKET` lets a dev build or the docs screenshot harness point
     /// the panel at another daemon (or a mock) without touching the install.
@@ -57,14 +101,26 @@ public actor UnixSocketTransport: ControlTransport {
     private let socketPath: String
     private let clientName: String
     private let queue = DispatchQueue(label: "openinstinct.panel.control")
+    private let requestTimeout: UInt64
 
-    public init(socketPath: String = UnixSocketTransport.defaultSocketPath, clientName: String = "openinstinct-panel") {
+    public init(socketPath: String = UnixSocketTransport.defaultSocketPath, clientName: String = "openinstinct-panel", requestTimeout: UInt64 = 8_000_000_000) {
         self.socketPath = socketPath
         self.clientName = clientName
+        self.requestTimeout = requestTimeout
     }
 
     public func request(_ request: ControlRequest) async throws -> ControlFrame {
         let connection = NWConnection(to: .unix(path: socketPath), using: .tcp)
+        return try await boundedControlOperation(timeout: requestTimeout) {
+            try await withTaskCancellationHandler {
+                try await self.performRequest(request, connection: connection)
+            } onCancel: {
+                connection.cancel()
+            }
+        }
+    }
+
+    private func performRequest(_ request: ControlRequest, connection: NWConnection) async throws -> ControlFrame {
         defer { connection.cancel() }
         // Connection-scoped so coalesced frames survive across reads.
         var reader = FrameReader()
@@ -101,6 +157,21 @@ public actor UnixSocketTransport: ControlTransport {
     /// history afterwards without a gap.
     public func subscribe() async throws -> ChatSubscription {
         let connection = NWConnection(to: .unix(path: socketPath), using: .tcp)
+        do {
+            return try await boundedControlOperation(timeout: requestTimeout) {
+                try await withTaskCancellationHandler {
+                    try await self.performSubscribe(connection: connection)
+                } onCancel: {
+                    connection.cancel()
+                }
+            }
+        } catch {
+            connection.cancel()
+            throw error
+        }
+    }
+
+    private func performSubscribe(connection: NWConnection) async throws -> ChatSubscription {
         var reader = FrameReader()
         var success = false
         defer {
@@ -168,6 +239,7 @@ public actor UnixSocketTransport: ControlTransport {
 
     private func waitUntilReady(_ connection: NWConnection) async throws {
         let queue = queue
+        try Task.checkCancellation()
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             connection.stateUpdateHandler = { state in
                 switch state {
@@ -190,6 +262,7 @@ public actor UnixSocketTransport: ControlTransport {
 
 
     private func send(_ frame: ControlFrame, over connection: NWConnection) async throws {
+        try Task.checkCancellation()
         var data = try ControlCodec.encode(frame)
         data.append(0x0A)
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -212,6 +285,7 @@ public actor UnixSocketTransport: ControlTransport {
     /// chunk carrying several frames yields them all instead of only the first.
     fileprivate static func readFrame(from connection: NWConnection, reader: inout FrameReader) async throws -> ControlFrame {
         while true {
+            try Task.checkCancellation()
             if let frame = try reader.nextFrame() {
                 return frame
             }
@@ -225,7 +299,8 @@ public actor UnixSocketTransport: ControlTransport {
     }
 
     fileprivate static func readChunk(from connection: NWConnection) async throws -> Data {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+        try Task.checkCancellation()
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
             connection.receive(minimumIncompleteLength: 1, maximumLength: 256 * 1024) { content, _, isComplete, error in
                 if let error {
                     continuation.resume(throwing: ControlTransportError.connectionFailed(error.localizedDescription))

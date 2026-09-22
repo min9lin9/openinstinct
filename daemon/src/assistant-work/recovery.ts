@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { stableAttemptId, type ActionRecord, type AttemptRecord, type AttemptRecoveryResult, type ClaimDueFollowupResult, type FollowupDispatchRecord, type ClaimRejectionReason, type JsonValue } from "./model.ts";
-import { canonicalJson } from "./model.ts";
-import type { AssistantWorkRepository, FollowupReportInput } from "../store/assistant-work.ts";
+import { actionMaterialDigest, canonicalJson } from "./model.ts";
+import { withMaterialIntegrityViolation, type AssistantWorkRepository, type FollowupReportInput } from "../store/assistant-work.ts";
+import { hasMaterialIntegrityViolation } from "../store/assistant-work.ts";
 
 export type FollowupDispatcherResult =
   | { readonly kind: "confirmed" | "definitive_failed" | "ambiguous"; readonly action: ActionRecord; readonly attempt: AttemptRecord; readonly evidence: JsonValue }
@@ -28,6 +29,20 @@ export type FollowupTickResult =
   | { readonly kind: "resumed_attempt"; readonly recovery: AttemptRecoveryResult; readonly result: FollowupDispatcherResult }
   | { readonly kind: "not_dispatched"; readonly reason: FollowupSkip["reason"] }
   | { readonly kind: "recovered_attempt"; readonly recovery: AttemptRecoveryResult };
+
+export type FollowupRecoveryResult = FollowupTickResult | {
+  readonly kind: "recovery_failed";
+  readonly actionId: string;
+  readonly error: Error;
+} & (
+  | { readonly dispatchId: string; readonly attemptId?: never }
+  | { readonly attemptId: string; readonly dispatchId?: never }
+);
+
+export interface FollowupRecoveryScope {
+  readonly dispatches: readonly Pick<FollowupDispatchRecord, "id" | "actionId" | "workId">[];
+  readonly attempts: readonly Pick<AttemptRecord, "id" | "actionId">[];
+}
 
 export function stableRecoveryReport(report: AuthoredRecoveryReport): FollowupReportInput {
   const id = createHash("sha256").update(canonicalJson({
@@ -89,29 +104,56 @@ export class FollowupRecoveryService {
     return { kind: "recovered_attempt", recovery };
   }
 
-  public async recover(): Promise<readonly FollowupTickResult[]> {
-    const results: FollowupTickResult[] = [];
+
+  public captureRecoveryScope(): FollowupRecoveryScope {
+    return {
+      dispatches: this.options.repository.listFollowupDispatches().filter((row) => row.state === "claimed")
+        .map(({ id, actionId, workId }) => ({ id, actionId, workId })),
+      attempts: this.options.repository.listRecoveryCandidates().map(({ id, actionId }) => ({ id, actionId })),
+    };
+  }
+
+  /** Each failed record is returned explicitly; unrelated records still recover. */
+  public async recover(scope: FollowupRecoveryScope = this.captureRecoveryScope()): Promise<readonly FollowupRecoveryResult[]> {
+    const results: FollowupRecoveryResult[] = [];
     const associated = new Set<string>();
-    for (const dispatch of this.options.repository.listFollowupDispatches().filter((row) => row.state === "claimed")) {
-      const action = this.options.repository.getAction(dispatch.actionId);
-      const attemptId = action?.activeAttemptId;
-      const claim = this.options.repository.recoverClaimedFollowup(dispatch.id, this.options.workerId, this.now());
-      if (attemptId) {
-        const recoveredAttempt = this.options.repository.getAttempt(attemptId);
-        if (recoveredAttempt?.state !== "effect_started" && recoveredAttempt?.state !== "claimed_pre_effect") {
-          associated.add(attemptId);
+    const failedFollowupActions = new Set<string>();
+    for (const dispatch of scope.dispatches) {
+      try {
+        if (this.options.repository.getFollowupDispatch(dispatch.id)?.state !== "claimed") continue;
+        const action = this.options.repository.getAction(dispatch.actionId);
+        const attemptId = action?.activeAttemptId;
+        const claim = this.options.repository.recoverClaimedFollowup(dispatch.id, this.options.workerId, this.now());
+        if (attemptId) {
+          const recoveredAttempt = this.options.repository.getAttempt(attemptId);
+          if (recoveredAttempt?.state !== "effect_started" && recoveredAttempt?.state !== "claimed_pre_effect") {
+            associated.add(attemptId);
+          }
         }
-      }
-      if (claim.kind === "none") {
-        await this.reportSkip(dispatch.workId, claim);
-        results.push({ kind: "not_dispatched", reason: claim.reason });
-      } else {
-        if (attemptId) associated.add(attemptId);
-        results.push(await this.executeClaim(claim));
+        if (claim.kind === "none") {
+          await this.reportSkip(dispatch.workId, claim);
+          results.push({ kind: "not_dispatched", reason: claim.reason });
+        } else {
+          if (attemptId) associated.add(attemptId);
+          results.push(await this.executeClaim(claim));
+        }
+      } catch (cause) {
+        // Dispatch identity is available even when strict action decoding fails.
+        failedFollowupActions.add(dispatch.actionId);
+        results.push({ kind: "recovery_failed", actionId: dispatch.actionId, dispatchId: dispatch.id,
+          error: new Error(`Assistant work recovery failed for dispatch ${dispatch.id} work ${dispatch.workId} action ${dispatch.actionId}`, { cause }) });
       }
     }
-    for (const attempt of this.options.repository.listRecoveryCandidates()) {
-      if (!associated.has(attempt.id)) results.push(await this.recoverAttempt(attempt.id));
+    for (const attempt of scope.attempts) {
+      if (associated.has(attempt.id) || failedFollowupActions.has(attempt.actionId)) continue;
+      try {
+        const current = this.options.repository.getAttempt(attempt.id);
+        if (!current || (current.state !== "claimed_pre_effect" && current.state !== "effect_started" && current.state !== "ambiguous")) continue;
+        results.push(await this.recoverAttempt(attempt.id));
+      } catch (cause) {
+        results.push({ kind: "recovery_failed", actionId: attempt.actionId, attemptId: attempt.id,
+          error: new Error(`Assistant work recovery failed for attempt ${attempt.id} action ${attempt.actionId}`, { cause }) });
+      }
     }
     return results;
   }
@@ -158,8 +200,16 @@ export class FollowupRecoveryService {
       }
       return { kind: "rejected", reason: "terminal", action, attempt: prior };
     }
+    // Bind the snapshot that is about to be preflighted and executed, not just
+    // the one checked at claim time: a rewrite landing in that window would
+    // otherwise be dispatched under the owner's approval. This falls through to
+    // the release below rather than returning early, so a tampered attempt is
+    // both refused and terminalized instead of being retried forever.
+    const materialIntact = actionMaterialDigest(action) === action.digest;
     let result: FollowupDispatcherResult;
-    try {
+    if (!materialIntact) {
+      result = { kind: "rejected", reason: "blocked", action };
+    } else try {
       result = await this.options.dispatch(action, attemptId, this.options.workerId);
     } catch (error) {
       const attempt = repository.getAttempt(attemptId);
@@ -167,6 +217,17 @@ export class FollowupRecoveryService {
         const settled = repository.markAttemptAmbiguous({ attemptId, workerId: this.options.workerId, outcome: { reason: "executor_threw_after_start" } }, this.now());
         return { kind: "ambiguous", ...settled, evidence: { reason: "executor_threw_after_start" } };
       }
+      // A throw before the effect started leaves nothing to reconcile, so the
+      // claim is released rather than left for every later drain to retry
+      // forever. The failure itself is still reported to the caller.
+      repository.releaseClaimedPreEffectAttempt({
+        actionId: action.id,
+        revision: action.revision,
+        digest: action.digest,
+        attemptId,
+        workerId: this.options.workerId,
+        reason: "pre_effect_executor_threw",
+      }, this.now());
       throw error;
     }
     if (result.kind !== "rejected") {
@@ -174,7 +235,35 @@ export class FollowupRecoveryService {
       if (!persisted || persisted.actionId !== action.id || persisted.actionRevision !== action.revision || persisted.state !== result.kind) {
         throw new Error("executor result lacks matching durable settlement");
       }
+      // A settlement recorded against rewritten material must be visible to the
+      // reports built from this result, not only inside the attempt row.
+      return hasMaterialIntegrityViolation(persisted.outcome)
+        ? { ...result, evidence: withMaterialIntegrityViolation(result.evidence) }
+        : result;
     }
+    // A rejected pre-effect dispatch would otherwise leave the attempt
+    // `claimed_pre_effect` forever: no effect ran, nothing can settle it, and
+    // every later drain retries it. Release it so the owner can re-propose.
+    //
+    // One atomic release, scoped to the attempt this call resumed and only
+    // while it is still pre-effect: an attempt that reached `effect_started`
+    // may already have touched the outside world and is reconciled instead.
+    // The expected attempt and worker are part of the same transaction as the
+    // write, so a takeover landing between a check and a cancel can no longer
+    // make this worker cancel another worker's claim.
+    //
+    // Fencing this on a worker *name* would be wrong in both directions:
+    // `recoverAttempt` is the ledger's ownership-transfer primitive and rewrites
+    // that name on takeover, and other components (main-session:managed-http,
+    // agent-email, child-session) own attempts this drain must still release.
+    repository.releaseClaimedPreEffectAttempt({
+      actionId: action.id,
+      revision: action.revision,
+      digest: action.digest,
+      attemptId,
+      workerId: this.options.workerId,
+      reason: "pre_effect_dispatch_rejected",
+    }, this.now());
     return result;
   }
 

@@ -181,6 +181,11 @@ const TRUSTED_HOST_TOOLS = new Set([
   "memory_search", "memory_capture", "memory_audit",
   "delegate_background", "child_nudge", "child_status", "report_progress",
   "monitor_author", "send_image",
+  // Capability tools that carry their own assistant-work action gate: every
+  // mutating mode proposes and executes through the ledger, so classifying
+  // them as opaque mutations here would both block their read-only modes and
+  // demand a second, unrelated approval for an already-approved effect.
+  "agent_email", "agent_call", "peer_coordinate",
 ]);
 
 function isManagedOrReadOnlyTool(toolName: string): boolean {

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { AssistantWorkRepository, AmbiguousAttemptResolutionInput } from "../store/assistant-work.ts";
-import { canonicalJson, type JsonValue } from "./model.ts";
+import { actionMaterialDigest, canonicalJson, type JsonValue } from "./model.ts";
 import { isManagedHttpActionRecord, parseManagedHttpPlan, verifyManagedHttpPlan } from "./http-effects.ts";
 import { configuredHttpAccess } from "./http-policy.ts";
 import { MANAGED_LOCAL_FILE_ACTION, parseLocalFilePlan, inspectLocalFilePlan, localContentDigest } from "./local-effects.ts";
@@ -11,6 +11,10 @@ export async function reconcileManagedAttempt(repository: AssistantWorkRepositor
   if (!attempt || attempt.state !== "ambiguous") return false;
   const action = repository.getAction(attempt.actionId);
   if (!action || action.state !== "ambiguous" || action.activeAttemptId !== attemptId) return false;
+  // Validate before anything is parsed, inspected, or fetched: reconciliation
+  // issues an independent verification request, and it must never be aimed by
+  // material that no longer matches what the owner approved.
+  if (actionMaterialDigest(action) !== action.digest) return false;
   let evidence: JsonValue;
   let source: string;
   if (isManagedHttpActionRecord(action)) {

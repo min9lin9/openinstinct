@@ -1,3 +1,6 @@
+import { normalizeHandle } from "../imessage/allowlist.ts";
+import { TRUSTED_PEER_RELATIONS } from "../peers/trusted.ts";
+
 export const CONTROL_VERSION = 1 as const;
 export const MAX_FRAME_BYTES = 256 * 1024;
 export const MAX_CONNECTION_BUFFER_BYTES = 1024 * 1024;
@@ -37,6 +40,9 @@ export const CONTROL_CAPABILITIES = [
   "browser.open",
   "maintenance.run",
   "memory.backfillCaptures",
+  "peers.list",
+  "peers.upsert",
+  "peers.revoke",
 ] as const;
 
 export const CHAT_EVENT_TOPICS = ["chat.message", "chat.presence"] as const;
@@ -253,6 +259,9 @@ export const FRAME_SCHEMA = {
     "providers.custom": ["id", "baseUrl", "api", "apiKey", "model"],
     "daemon.restart": [],
     "browser.open": [],
+    "peers.list": [],
+    "peers.upsert": ["handle", "displayName", "relation"],
+    "peers.revoke": ["handle"],
   },
 
 } as const;
@@ -531,7 +540,43 @@ function validateKnownPayload(verb: KnownVerb, payload: Record<string, unknown>)
     case "session.compact.status":
       expectNonEmptyString(payload.operationId, "session.compact.status.operationId");
       return;
+    case "peers.list":
+      return;
+    case "peers.upsert":
+      assertTrustedPeerHandle(payload.handle, "peers.upsert.handle");
+      expectBoundedNonEmptyString(payload.displayName, "peers.upsert.displayName", 512);
+      assertTrustedPeerRelation(payload.relation, "peers.upsert.relation");
+      return;
+    case "peers.revoke":
+      assertTrustedPeerHandle(payload.handle, "peers.revoke.handle");
+      return;
   }
+}
+
+function assertTrustedPeerHandle(value: unknown, name: string): string {
+  const handle = expectBoundedNonEmptyString(value, name, 128);
+  if (normalizeHandle(handle) === undefined) {
+    throw new FrameValidationError(`${name} must be a valid handle`);
+  }
+  return handle;
+}
+
+function assertTrustedPeerRelation(value: unknown, name: string): void {
+  const relation = expectString(value, name);
+  if (!(TRUSTED_PEER_RELATIONS as readonly string[]).includes(relation)) {
+    throw new FrameValidationError(`${name} is invalid`);
+  }
+}
+
+function expectBoundedNonEmptyString(value: unknown, name: string, maximum: number): string {
+  const string = expectNonEmptyString(value, name);
+  if (string.trim().length === 0) {
+    throw new FrameValidationError(`${name} must not be blank`);
+  }
+  if (string.length > maximum) {
+    throw new FrameValidationError(`${name} must be no longer than ${maximum} characters`);
+  }
+  return string;
 }
 
 function expectObject(value: unknown, name: string): Record<string, unknown> {

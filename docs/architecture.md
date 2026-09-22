@@ -214,7 +214,9 @@ approval/rejection commands are exact, standalone, text-only lines:
 The digest is 64 lowercase hexadecimal characters. Attachments, extra words,
 unknown actions, and stale revisions/digests are rejected. `supportsManagedApproval`
 recognizes the managed local-file action and validates the persisted payload for
-managed-install, managed-HTTP, and managed opaque-tool records. Ordinary
+managed-install, managed-HTTP, managed opaque-tool, and peer-envelope records —
+the last through `isPeerEnvelopeAction`, which requires a decodable envelope
+whose handle and thread key match the action's own recipient and topic. Ordinary
 conversation and content copied from a
 website, message, monitor, child, memory, or tool are never approval. `/reject`
 cancels the matching current revision without running it. `/approve` records
@@ -271,8 +273,8 @@ The managed HTTP tool is registered from `main.ts` with `configuredHttpAccess()`
 and is the only way to allow private/local addresses; cloud metadata endpoints
 remain blocked. `OI_HTTP_SECRET_BINDINGS` is a JSON object whose host-owned
 entries contain exactly `origin`, `header`, and `environment`, for example
-`{"mailApi":{"origin":"https://api.example","header":"Authorization","environment":"MAIL_API_TOKEN"}}`.
-Tool calls carry a `secretRef` such as `mailApi`, never the secret value. The
+`{"secret://mail-api":{"origin":"https://api.example","header":"Authorization","environment":"MAIL_API_TOKEN"}}`.
+Tool calls carry a `secretRef` such as `secret://mail-api`, never the secret value. The
 daemon snapshots the named environment value and resolves it only when both the
 exact origin and header match. Sensitive
 headers, query parameters, and body keys cannot contain plaintext credentials.
@@ -281,6 +283,99 @@ followed, DNS answers are validated and pinned for the connection, and an
 unverified post-mutation result is `ambiguous`, not success.
 Host operators place these values in the daemon's private `~/.openinstinct/env`
 file (`KEY=value`, mode 0600); prompt content cannot edit the host policy.
+
+### The agent's own email identity
+
+`configuredAgentEmail()` (`daemon/src/email/identity.ts`) returns an identity
+only when `OI_AGENT_EMAIL_ADDRESS` is set; a partially configured identity is a
+startup error rather than a silent downgrade. The identity names the provider
+send origin/path, the inbox URL, and the `secretRef` that carries the provider
+credential — never the credential itself.
+
+Sending rides the managed HTTP effect, so an agent email is one `external_message`
+action in the same ledger as every other outbound effect: proposed with an exact
+body (`clientReference`, `from`, `to`, `subject`, `text`), a verification GET
+that must return `acceptedReference` for that same reference, a stable digest
+over recipient/subject/body, and a single claimed attempt. Authorization is
+capability-owned rather than a generic host message binding: `main.ts` composes
+no email template into `OI_HTTP_MESSAGE_BINDINGS` at all.
+`agentEmailPlanAuthorizer` rebuilds the expected plan from the identity and the
+candidate's own draft fields and authorizes only a byte-identical match — URL,
+method, body, headers including the credential reference, verification URL, and
+the expectation. A binding can pin body fields but not the credential reference
+or the verification endpoint, so a generic `assistant_managed_http` request
+could otherwise claim `external_message` classification (and any owner send
+rule for it) while swapping the credential or pointing verification somewhere
+harmless. Byte equality also makes duplicate members, escaped key spellings,
+and whitespace variants simply *not this plan*, so authorization never depends
+on how a body happens to parse. Verification is correlated *and* success-bearing
+in one field: the provider returns `acceptedReference` only for a message it
+actually accepted and only for the reference asked about, because a managed
+plan carries exactly one expectation. The reference is scoped to the owning work
+item, and a repeat policy is refused for correlated capability actions, since a
+repeat copying the payload could be confirmed by the first effect's status.
+The host also proves the credential binding, its exact origin/header use, a
+non-empty value, and, for plaintext HTTP, an origin that is both declared in `OI_HTTP_LOCAL_ORIGINS` and a literal loopback/RFC1918/unique-local address — a DNS name, including `localhost`, is rejected because dispatch decides by the address resolved at request time, so a
+capability can never be registered in a state where an approved send would fail
+only at dispatch. Because the class is `external_message`, an exact `/allow-send`
+recipient/topic/action rule can authorize routine mail; everything else waits for
+`/approve` naming that ID, revision, and digest.
+
+Inbound mail is evidence, not authority. `ingestAgentEmail()` admits one
+idempotent observation per provider message ID with
+`provenance.principal = "third_party"` and `channel = "email"`, bounded evidence
+text, and a hard refusal of mail whose sender is the agent's own address, so a
+self-addressed loop cannot manufacture work.
+
+### Trusted-peer coordination
+
+The owner's assistant can coordinate with another person's assistant over the
+existing iMessage transport, restricted to an explicit allow-list in
+`trusted_peers` (`store.listTrustedPeers`, `upsertTrustedPeer`,
+`revokeTrustedPeer`), administered through the authenticated `peers.list` /
+`peers.upsert` / `peers.revoke` control ops rather than a model tool, because
+enrolling or revoking a person moves the trust boundary. Handles are
+canonicalized with the same `imessage/allowlist.ts` normalizer the owner gate
+uses, so the trust check and the lookup cannot disagree. Trust is re-evaluated
+at the send boundary, not only at proposal, so revoking a peer also stops an
+envelope that was already approved for them.
+
+The wire format is a single-line `OI-PEER/1` JSON envelope
+(`daemon/src/peers/envelope.ts`) with exactly `v`, `kind`, `threadKey`,
+`subject`, `body`, and a 32-hex `nonce`. `decodePeerEnvelope` returns
+`undefined` rather than throwing for anything malformed — unknown keys, a wrong
+version, control characters, oversized fields, or a bad nonce — because the
+sender is untrusted input.
+
+`handleOwnerMessages` in `main.ts` never promotes a non-owner message to an
+owner turn. Non-owner rows go to `admitInboundPeerMessage`, which admits at most
+one `third_party` observation per handle+nonce for a `trusted` peer and ignores
+everything else (`not_an_envelope`, `untrusted_peer`, `revoked_peer`) — a
+revoked peer is ignored even though its earlier rows remain. Outbound envelopes
+are `external_message` actions bound to that exact handle and thread key,
+claimed before the send and settled `confirmed` with the delivery receipt or
+`ambiguous` when the transport fails after the effect may have landed. Repeat
+policies are refused for peer envelopes: the nonce is single-use and the
+managed dispatcher has no peer repeat executor, so an accepted policy could
+only ever be cancelled when due.
+
+### Outbound calls
+
+`configuredCallProvider()` (`daemon/src/calls/provider.ts`) reads the telephony
+provider origin, create/status paths, caller ID, and `secretRef`, with strict
+E.164 normalization for the callee. A placed call is irreversible and billable,
+so `proposeAgentCall()` classifies it `external_mutation`, which
+`ownerRuleCanAuthorize()` refuses by construction: every call requires an
+authenticated `/approve` for that exact identity, and no send rule can stand in
+for it. The proposal carries the callee, purpose, the script the agent is
+authorized to say, and a 1–30 minute cap as approval-legible scope and cost
+material. Placement is one POST plus the provider status verification, and that
+verification is bound to a per-call `clientReference` that the provider echoes
+as `placedReference` only for a call it actually placed: a status endpoint
+reporting only `placed` would let a prior or concurrent call confirm this
+billable one, and a correlated `not_placed` must not confirm either. A 5xx is `definitive_failed` with no second POST, a
+hang or an uncorrelated status is `ambiguous`, surfaced as `uncertain` and never
+auto-retried, and an aborted tool invocation never reaches the POST.
 
 ### Adaptive owner notifications
 

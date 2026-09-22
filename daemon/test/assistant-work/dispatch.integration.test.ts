@@ -143,6 +143,7 @@ describe("managed executor dispatch selection", () => {
         attemptId: localAttemptId,
         workerId: "dispatch-local-worker",
         httpAccess: access,
+        now: () => "2026-01-01T00:00:00.000Z",
       });
       expect(localResult).toMatchObject({
         kind: "confirmed",
@@ -161,6 +162,7 @@ describe("managed executor dispatch selection", () => {
         attemptId: httpAttemptId,
         workerId: "dispatch-http-worker",
         httpAccess: access,
+        now: () => "2026-01-01T00:00:00.000Z",
       });
       expect(httpResult).toMatchObject({
         kind: "confirmed",
@@ -231,6 +233,7 @@ describe("managed executor dispatch selection", () => {
         attemptId: stableAttemptId(unsupported.id, unsupported.revision, "unsupported-dispatch"),
         workerId: "dispatch-unsupported-worker",
         httpAccess: access,
+        now: () => "2026-01-01T00:00:00.000Z",
       });
       expect(result).toMatchObject({ kind: "rejected", reason: "blocked", action: { id: unsupported.id } });
       expect(existsSync(localPath)).toBe(false);

@@ -15,6 +15,7 @@ import { applyHistoryByteBudget, mergeOwnerHistory, readOwnerFacingHistory, stri
 
 import { MANAGED_LOCAL_FILE_ACTION } from "./assistant-work/local-effects.ts";
 import { MANAGED_INSTALL_ACTION, parseManagedInstallPlan } from "./assistant-work/install.ts";
+import { PEER_COORDINATION_ACTION, isPeerEnvelopeAction } from "./peers/coordination.ts";
 import { isManagedHttpActionRecord } from "./assistant-work/http-effects.ts";
 import { isManagedOpaqueToolAction } from "./assistant-work/tool-gate.ts";
 import {
@@ -72,7 +73,7 @@ export type OwnerActionCommandParseResult =
 
 type OwnerHostCommandOperation = OwnerActionCommand["operation"] | OwnerSendRuleCommand["operation"] | OwnerFollowupCommand["operation"] | "invalid";
 
-const OWNER_ACTION_COMMAND_USAGE = "Use exactly /approve ACTION_ID REVISION DIGEST or /reject ACTION_ID REVISION DIGEST. Approval execution is available only for managed local-file, managed-install, and managed-HTTP actions.";
+const OWNER_ACTION_COMMAND_USAGE = "Use exactly /approve ACTION_ID REVISION DIGEST or /reject ACTION_ID REVISION DIGEST. Approval execution is available only for managed local-file, managed-install, managed-HTTP, and peer-envelope actions.";
 
 /** Recognizes only exact standalone commands; ordinary text is never authority. */
 export function parseOwnerActionCommand(text: string): OwnerActionCommandParseResult | undefined {
@@ -1130,6 +1131,7 @@ function ownerCommandProvenance(request: OwnerTurnRequest, ownerHandle: string |
 
 function supportsManagedApproval(action: ActionRecord): boolean {
   if (action.action === MANAGED_LOCAL_FILE_ACTION) return true;
+  if (action.action === PEER_COORDINATION_ACTION && isPeerEnvelopeAction(action)) return true;
   if (isManagedHttpActionRecord(action)) return true;
   if (isManagedOpaqueToolAction(action)) return true;
   if (action.action !== MANAGED_INSTALL_ACTION) return false;

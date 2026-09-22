@@ -64,4 +64,29 @@ describe("ImessageSender (AppleScript bridge)", () => {
     await Promise.all([sender.sendText("+1", "a"), sender.sendText("+1", "b")]);
     expect(order).toEqual(["start:a", "end:a", "start:b", "end:b"]);
   });
+
+  test("a guarded send runs its guard inside the queued slot, not before it", async () => {
+    // A queue with one slow send ahead of the guarded one: the guard must be
+    // evaluated when the guarded send reaches the transport, not when it was
+    // enqueued, or a revocation landing while it waits would go unnoticed.
+    const { seen, runner } = recorder({}, 60);
+    const sender = new ImessageSender({ runner });
+    const slow = sender.sendText("+821011111111", "first");
+    let trusted = true;
+    const guarded = sender.sendTextGuarded("+821012345678", "second", () => trusted);
+    trusted = false;
+    await slow;
+    await expect(guarded).rejects.toThrow(/guard refused/);
+    // Only the first send reached osascript; the refused one never did.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.slice(-2)).toEqual(["+821011111111", "first"]);
+
+    // The inverse: a guard that still holds sends exactly once.
+    const allowed = recorder();
+    const second = new ImessageSender({ runner: allowed.runner });
+    await expect(second.sendTextGuarded("+821012345678", "third", () => true))
+      .resolves.toMatchObject({ messageId: expect.stringMatching(/^applescript:/) });
+    expect(allowed.seen).toHaveLength(1);
+    expect(allowed.seen[0]!.slice(-2)).toEqual(["+821012345678", "third"]);
+  });
 });

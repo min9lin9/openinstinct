@@ -6,6 +6,8 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 
 import type { CustomTool } from "@gajae-code/coding-agent";
 import { Type } from "@gajae-code/coding-agent/extensibility/typebox";
+import { actionMaterialDigest } from "./model.ts";
+import { hasMaterialIntegrityViolation } from "../store/assistant-work.ts";
 
 import type { AssistantWorkRepository } from "../store/assistant-work.ts";
 import {
@@ -669,13 +671,28 @@ export function installArgv(plan: ManagedInstallPlan): readonly string[] {
 // A marker is only structural evidence. A non-empty root becomes ordinary only
 // after the durable ledger contains a confirmed managed install for that path;
 // package contents or model-authored labels cannot create local-policy authority.
+/**
+ * True when a persisted action is a prior confirmed install that still confers
+ * local-policy authority: its material must still hash to the approved digest
+ * and it must carry a confirming attempt that was not recorded against altered
+ * material. A rewritten history must not widen a later install's class.
+ */
+export function priorInstallConfersLocalPolicy(
+  action: ActionRecord,
+  attempts: readonly AttemptRecord[],
+): boolean {
+  if (action.action !== MANAGED_INSTALL_ACTION || action.state !== "confirmed") return false;
+  if (actionMaterialDigest(action) !== action.digest) return false;
+  return attempts.some((attempt) => attempt.state === "confirmed" && !hasMaterialIntegrityViolation(attempt.outcome));
+}
+
 function authorizeDedicatedRoot(
   inventory: ManagedInstallInventory,
   repository: AssistantWorkRepository | undefined,
 ): ManagedInstallInventory {
   if (!inventory.dedicatedToolRoot || !inventory.existing || inventory.entries.length === 0) return inventory;
   const confirmed = repository?.listActions().some((action) => {
-    if (action.action !== MANAGED_INSTALL_ACTION || action.state !== "confirmed") return false;
+    if (!priorInstallConfersLocalPolicy(action, repository.listAttempts(action.id))) return false;
     try {
       const prior = parseManagedInstallPlan(action.payload);
       const physicalCandidate = !prior.precondition.existing

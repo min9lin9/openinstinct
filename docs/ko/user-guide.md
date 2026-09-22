@@ -113,7 +113,7 @@ Chat 창에 입력하거나, 선택적 iMessage 레인이 연결된 뒤 폰에�
 
 ### 관리형 HTTP 호스트 설정
 
-관리형 HTTP의 endpoint와 자격 증명 권한은 프롬프트나 웹페이지가 아니라 데몬 호스트 설정에서 옵니다. `OI_HTTP_LOCAL_ORIGINS`는 private/local 주소를 허용할 정확한 `scheme://host[:port]` origin의 JSON 배열입니다. `OI_HTTP_SECRET_BINDINGS`는 툴에 보이는 reference를 정확한 `origin`, `header`, 환경 변수 이름에 연결합니다(예: `{"mailApi":{"origin":"https://api.example","header":"Authorization","environment":"MAIL_API_TOKEN"}}`). 모델은 평문 토큰 대신 `mailApi` 같은 `secretRef`만 전달하며, binding은 origin과 header가 모두 일치할 때만 사용됩니다. 민감한 header, URL query, body에 평문 자격 증명을 넣을 수 없고 공용 평문 HTTP로 secret reference를 보낼 수도 없습니다. redirect는 따라가지 않으며 별도 GET이 기대 상태를 입증해야 변경을 성공으로 기록합니다.
+관리형 HTTP의 endpoint와 자격 증명 권한은 프롬프트나 웹페이지가 아니라 데몬 호스트 설정에서 옵니다. `OI_HTTP_LOCAL_ORIGINS`는 private/local 주소를 허용할 정확한 `scheme://host[:port]` origin의 JSON 배열입니다. `OI_HTTP_SECRET_BINDINGS`는 툴에 보이는 reference를 정확한 `origin`, `header`, 환경 변수 이름에 연결합니다(예: `{"secret://mail-api":{"origin":"https://api.example","header":"Authorization","environment":"MAIL_API_TOKEN"}}`). 모델은 평문 토큰 대신 `secret://mail-api` 같은 `secretRef`만 전달하며, binding은 origin과 header가 모두 일치할 때만 사용됩니다. 민감한 header, URL query, body에 평문 자격 증명을 넣을 수 없고 공용 평문 HTTP로 secret reference를 보낼 수도 없습니다. redirect는 따라가지 않으며 별도 GET이 기대 상태를 입증해야 변경을 성공으로 기록합니다.
 이 호스트 변수는 `~/.openinstinct/env`에 `KEY=value` 줄로 넣고 파일 mode를 0600으로 유지합니다. 대화 중 가재가 새로 만들 수 있는 권한이 아니라 운영자 설정입니다.
 
 ### 나를 따라오는 알림

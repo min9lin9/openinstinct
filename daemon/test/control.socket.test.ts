@@ -387,4 +387,53 @@ describe("control socket", () => {
       store.close();
     }
   });
+
+  test("administers trusted peers through the real control server", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "openinstinct-control-peers-"));
+    directories.push(directory);
+    const path = join(directory, "run", "control.sock");
+    const store = openStateStore(join(directory, "state.db"));
+    let control: ControlServer | undefined;
+    let socket: Socket | undefined;
+
+    try {
+      control = await startControlServer({
+        path,
+        store,
+        getStatus: () => ({
+          state: "running",
+          probes: { config: { status: "passed" }, credentials: { status: "passed" } },
+        }),
+      });
+      socket = createConnection({ path });
+      await once(socket, "connect");
+      // The allow-list is administered only here, so the production socket
+      // branches must actually work: a clean install cannot enroll otherwise.
+      const response = readFrames(socket, 5);
+      socket.write(`${JSON.stringify({ type: "hello", v: 1, client: "control-test" })}\n`);
+      socket.write(`${JSON.stringify({ type: "request", id: "list-0", verb: "peers.list", payload: {} })}\n`);
+      socket.write(`${JSON.stringify({ type: "request", id: "add-1", verb: "peers.upsert", payload: { handle: "+821099998888", displayName: "Alex", relation: "household" } })}\n`);
+      socket.write(`${JSON.stringify({ type: "request", id: "list-1", verb: "peers.list", payload: {} })}\n`);
+      socket.write(`${JSON.stringify({ type: "request", id: "revoke-1", verb: "peers.revoke", payload: { handle: "+821099998888" } })}\n`);
+
+      const [, empty, added, listed, revoked] = await response;
+      expect(empty).toMatchObject({ id: "list-0", ok: true, payload: { peers: [] } });
+      expect(added).toMatchObject({
+        id: "add-1",
+        ok: true,
+        payload: { peer: { handle: "+821099998888", displayName: "Alex", relation: "household", state: "trusted" } },
+      });
+      expect(listed).toMatchObject({ id: "list-1", ok: true });
+      expect((listed as { payload: { peers: unknown[] } }).payload.peers).toHaveLength(1);
+      expect(revoked).toMatchObject({ id: "revoke-1", ok: true, payload: { peer: { state: "revoked" } } });
+
+      // The durable effect of those ops is what the peer lane reads.
+      expect(store.listTrustedPeers("trusted")).toHaveLength(0);
+      expect(store.listTrustedPeers()).toHaveLength(1);
+    } finally {
+      socket?.destroy();
+      await control?.close();
+      store.close();
+    }
+  });
 });

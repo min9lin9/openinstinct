@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -50,10 +51,26 @@ afterEach(() => {
   }
 });
 
+const storePaths = new WeakMap<object, string>();
+
+/** Direct row access, used only to model a post-approval tamper. */
+function stateDbPathFor(store: object): string {
+  const path = storePaths.get(store);
+  if (path === undefined) throw new Error("store path is unknown");
+  return path;
+}
+
 function stateDbPath(): string {
   const directory = mkdtempSync(join(tmpdir(), "openinstinct-recovery-"));
   directories.push(directory);
   return join(directory, "state.db");
+}
+
+function openTrackedStore(): ReturnType<typeof openStateStore> {
+  const path = stateDbPath();
+  const store = openStateStore(path);
+  storePaths.set(store, path);
+  return store;
 }
 
 function setupConfirmedMessage(
@@ -361,6 +378,33 @@ describe("durable follow-up policy", () => {
 });
 
 describe("follow-up dispatch races and recovery", () => {
+  test("recovery returns the original executor failure and continues later claimed dispatches", async () => {
+    const store = openStateStore(stateDbPath());
+    try {
+      const first = setupConfirmedMessage(store, "executor-fails");
+      const second = setupConfirmedMessage(store, "executor-healthy");
+      setPolicy(store, first.work.id, first.action.id, 1);
+      setPolicy(store, second.work.id, second.action.id, 1);
+      const failed = store.assistantWork.claimDueFollowup(first.work.id, "worker", T1);
+      const healthy = store.assistantWork.claimDueFollowup(second.work.id, "worker", T1);
+      if (failed.kind !== "claimed" || healthy.kind !== "claimed") throw new Error("expected claimed fixtures");
+      const cause = new Error("executor unavailable before effect");
+      const executor = confirmedExecutor(store.assistantWork);
+      const service = new FollowupRecoveryService({ repository: store.assistantWork, workerId: "worker", now: () => T1,
+        dispatch: async (action, attemptId, workerId) => {
+          if (action.id === failed.action.id) throw cause;
+          return executor.dispatch(action, attemptId, workerId);
+        } });
+      const results = await service.recover();
+      const failure = results.find((result) => result.kind === "recovery_failed");
+      expect(failure).toMatchObject({ kind: "recovery_failed", actionId: failed.action.id, dispatchId: failed.dispatch.id });
+      if (failure?.kind !== "recovery_failed") throw new Error("expected explicit failure");
+      expect(failure.error.cause).toBe(cause);
+      expect(executor.calls.map((call) => call.actionId)).toEqual([healthy.action.id]);
+      expect(store.assistantWork.getFollowupDispatch(healthy.dispatch.id)?.state).toBe("completed");
+      expect(store.assistantWork.listAttempts(failed.action.id)).toHaveLength(0);
+    } finally { store.close(); }
+  });
   test("concurrent ticks invoke one real executor and persist one ordinal settlement", async () => {
     const path = stateDbPath();
     const firstStore = openStateStore(path);
@@ -706,4 +750,313 @@ describe("follow-up dispatch races and recovery", () => {
       reopened.close();
     }
   });
+});
+
+test("a rejected pre-effect recovery releases the claim instead of stranding it", async () => {
+  const store = openStateStore(stateDbPath());
+  try {
+    const at = "2026-01-01T00:00:00.000Z";
+    const work = store.assistantWork.admitObservation({
+      source: "fixture", occurrenceKey: "strand", workKey: "strand", workTitle: "strand", observedAt: at,
+      evidence: {}, provenance: { principal: "system", channel: "fixture", subject: "strand", evidenceId: "strand" },
+    }, at).work;
+    const action = store.assistantWork.proposeAction({
+      workId: work.id, semanticKey: "strand", effectClass: "external_mutation",
+      recipient: "someone", topic: "topic", action: "unsupported_executor",
+      payload: { note: "no executor exists for this" },
+    }, at);
+    store.assistantWork.grantExplicitApproval({
+      actionId: action.id, revision: action.revision, digest: action.digest,
+      provenance: { principal: "owner", channel: "fixture", subject: "owner", evidenceId: "strand" },
+    }, at);
+    const attemptId = "strand-attempt";
+    expect(store.assistantWork.claimForDispatch({
+      actionId: action.id, revision: action.revision, digest: action.digest, attemptId, workerId: "crashed",
+    }, at).kind).toBe("claimed");
+
+    // The daemon crashed after the claim. Recovery has no executor for this
+    // action, so without a release the attempt stays claimed_pre_effect and
+    // every later drain retries it while nothing can ever settle it.
+    const service = new FollowupRecoveryService({
+      repository: store.assistantWork,
+      workerId: "crashed",
+      dispatch: async () => ({ kind: "rejected", reason: "blocked" }),
+      now: () => at,
+    });
+    const recovered = await service.recoverAttempt(attemptId);
+    expect(recovered.kind).toBe("resumed_attempt");
+    expect(store.assistantWork.getAction(action.id)).toMatchObject({ state: "cancelled" });
+    // The attempt is terminal, so no later drain can retry it and nothing is
+    // left waiting for a settlement that can never come.
+    expect(store.assistantWork.getAttempt(attemptId)?.state).toBe("cancelled");
+  } finally {
+    store.close();
+  }
+});
+
+test("a tampered pre-effect resume is refused and released rather than retried forever", async () => {
+  const store = openTrackedStore();
+  try {
+    const at = "2026-01-01T00:00:00.000Z";
+    const work = store.assistantWork.admitObservation({
+      source: "fixture", occurrenceKey: "tamper", workKey: "tamper", workTitle: "tamper", observedAt: at,
+      evidence: {}, provenance: { principal: "system", channel: "fixture", subject: "tamper", evidenceId: "tamper" },
+    }, at).work;
+    const action = store.assistantWork.proposeAction({
+      workId: work.id, semanticKey: "tamper", effectClass: "external_mutation",
+      recipient: "someone", topic: "topic", action: "managed_http_request",
+      payload: { body: JSON.stringify({ status: "safe" }) },
+    }, at);
+    store.assistantWork.grantExplicitApproval({
+      actionId: action.id, revision: action.revision, digest: action.digest,
+      provenance: { principal: "owner", channel: "fixture", subject: "owner", evidenceId: "tamper" },
+    }, at);
+    const attemptId = "tamper-attempt";
+    store.assistantWork.claimForDispatch({
+      actionId: action.id, revision: action.revision, digest: action.digest, attemptId, workerId: "w",
+    }, at);
+    // Rewrite the material after the claim, keeping the approved digest.
+    const db = new Database(stateDbPathFor(store));
+    try {
+      db.query("UPDATE assistant_work_action_revisions SET payload_json = ? WHERE action_id = ?")
+        .run(JSON.stringify({ body: JSON.stringify({ status: "pwned" }) }), action.id);
+    } finally {
+      db.close();
+    }
+
+    let dispatched = 0;
+    const service = new FollowupRecoveryService({
+      repository: store.assistantWork,
+      workerId: "w",
+      dispatch: async () => { dispatched += 1; return { kind: "rejected", reason: "blocked" }; },
+      now: () => at,
+    });
+    const recovered = await service.recoverAttempt(attemptId);
+    // Refused: the tampered snapshot never reaches an executor.
+    expect(dispatched).toBe(0);
+    expect(recovered).toMatchObject({ kind: "resumed_attempt", result: { kind: "rejected" } });
+    // Released: without this the attempt stays claimed_pre_effect and every
+    // later drain retries it while nothing can ever settle it.
+    expect(store.assistantWork.getAction(action.id)).toMatchObject({ state: "cancelled" });
+    expect(store.assistantWork.getAttempt(attemptId)?.state).toBe("cancelled");
+  } finally {
+    store.close();
+  }
+});
+
+test("recovery releases only the attempt it resumed, and only while it is still pre-effect", async () => {
+  const store = openStateStore(stateDbPath());
+  try {
+    const at = "2026-01-01T00:00:00.000Z";
+    const work = store.assistantWork.admitObservation({
+      source: "fixture", occurrenceKey: "fence", workKey: "fence", workTitle: "fence", observedAt: at,
+      evidence: {}, provenance: { principal: "system", channel: "fixture", subject: "fence", evidenceId: "fence" },
+    }, at).work;
+    const action = store.assistantWork.proposeAction({
+      workId: work.id, semanticKey: "fence", effectClass: "external_mutation",
+      recipient: "someone", topic: "topic", action: "unsupported_executor",
+      payload: { note: "no executor" },
+    }, at);
+    store.assistantWork.grantExplicitApproval({
+      actionId: action.id, revision: action.revision, digest: action.digest,
+      provenance: { principal: "owner", channel: "fixture", subject: "owner", evidenceId: "fence" },
+    }, at);
+    const attemptId = "fence-attempt";
+    store.assistantWork.claimForDispatch({
+      actionId: action.id, revision: action.revision, digest: action.digest, attemptId, workerId: "worker-a",
+    }, at);
+
+    // A different component worker drained recovery and hit a rejection. The
+    // ledger handed it this interrupted attempt, so it must release it: fencing
+    // on worker names would strand every attempt another component owns.
+    const service = new FollowupRecoveryService({
+      repository: store.assistantWork,
+      workerId: "main-session:managed-http",
+      dispatch: async () => ({ kind: "rejected", reason: "blocked" }),
+      now: () => at,
+    });
+    await service.recoverAttempt(attemptId);
+    expect(store.assistantWork.getAction(action.id)).toMatchObject({ state: "cancelled" });
+    expect(store.assistantWork.getAttempt(attemptId)?.state).toBe("cancelled");
+
+    // An attempt that moved on to effect_started is never cancelled by the
+    // release: something may already have reached the outside world.
+    const later = store.assistantWork.proposeAction({
+      workId: work.id, semanticKey: "fence-later", effectClass: "external_mutation",
+      recipient: "someone", topic: "topic", action: "unsupported_executor",
+      payload: { note: "no executor" },
+    }, at);
+    store.assistantWork.grantExplicitApproval({
+      actionId: later.id, revision: later.revision, digest: later.digest,
+      provenance: { principal: "owner", channel: "fixture", subject: "owner", evidenceId: "fence-later" },
+    }, at);
+    const laterAttempt = "fence-later-attempt";
+    store.assistantWork.claimForDispatch({
+      actionId: later.id, revision: later.revision, digest: later.digest, attemptId: laterAttempt, workerId: "worker-a",
+    }, at);
+    store.assistantWork.markEffectStarted({ attemptId: laterAttempt, workerId: "worker-a" }, at);
+    await service.recoverAttempt(laterAttempt);
+    expect(store.assistantWork.getAction(later.id)?.state).not.toBe("cancelled");
+    expect(store.assistantWork.getAttempt(laterAttempt)?.state).toBe("ambiguous");
+  } finally {
+    store.close();
+  }
+});
+
+test("the recovery service surfaces a material-integrity marker on the settled result", async () => {
+  const store = openTrackedStore();
+  try {
+    const at = "2026-01-01T00:00:00.000Z";
+    const work = store.assistantWork.admitObservation({
+      source: "fixture", occurrenceKey: "surface", workKey: "surface", workTitle: "surface", observedAt: at,
+      evidence: {}, provenance: { principal: "system", channel: "fixture", subject: "surface", evidenceId: "surface" },
+    }, at).work;
+    const action = store.assistantWork.proposeAction({
+      workId: work.id, semanticKey: "surface", effectClass: "external_mutation",
+      recipient: "someone", topic: "topic", action: "managed_http_request",
+      payload: { body: JSON.stringify({ status: "safe" }) },
+    }, at);
+    store.assistantWork.grantExplicitApproval({
+      actionId: action.id, revision: action.revision, digest: action.digest,
+      provenance: { principal: "owner", channel: "fixture", subject: "owner", evidenceId: "surface" },
+    }, at);
+    const attemptId = "surface-attempt";
+    store.assistantWork.claimForDispatch({
+      actionId: action.id, revision: action.revision, digest: action.digest, attemptId, workerId: "w",
+    }, at);
+
+    // The tamper lands AFTER the pre-dispatch digest check and before the
+    // executor settles, so the settlement is recorded (the effect happened) and
+    // the marker must travel out on the result the reports are built from.
+    const path = stateDbPathFor(store);
+    const executor = confirmedExecutor(store.assistantWork, () => ({ ok: true }), () => {
+      const db = new Database(path);
+      try {
+        db.query("UPDATE assistant_work_action_revisions SET payload_json = ? WHERE action_id = ?")
+          .run(JSON.stringify({ body: JSON.stringify({ status: "pwned" }) }), action.id);
+      } finally {
+        db.close();
+      }
+    }, () => at);
+    const service = new FollowupRecoveryService({
+      repository: store.assistantWork,
+      workerId: "w",
+      dispatch: executor.dispatch,
+      now: () => at,
+    });
+
+    const recovered = await service.recoverAttempt(attemptId);
+    expect(recovered).toMatchObject({
+      kind: "resumed_attempt",
+      result: { kind: "confirmed", evidence: { materialIntegrityViolation: true, outcome: { ok: true } } },
+    });
+  } finally {
+    store.close();
+  }
+
+});
+
+test("a throwing pre-effect executor releases the claim instead of stranding it", async () => {
+  const store = openStateStore(stateDbPath());
+  try {
+    const at = "2026-01-01T00:00:00.000Z";
+    const work = store.assistantWork.admitObservation({
+      source: "fixture", occurrenceKey: "throw", workKey: "throw", workTitle: "throw", observedAt: at,
+      evidence: {}, provenance: { principal: "system", channel: "fixture", subject: "throw", evidenceId: "throw" },
+    }, at).work;
+    const action = store.assistantWork.proposeAction({
+      workId: work.id, semanticKey: "throw", effectClass: "external_mutation",
+      recipient: "someone", topic: "topic", action: "managed_http_request",
+      payload: { body: JSON.stringify({ status: "safe" }) },
+    }, at);
+    store.assistantWork.grantExplicitApproval({
+      actionId: action.id, revision: action.revision, digest: action.digest,
+      provenance: { principal: "owner", channel: "fixture", subject: "owner", evidenceId: "throw" },
+    }, at);
+    const attemptId = "throw-attempt";
+    store.assistantWork.claimForDispatch({
+      actionId: action.id, revision: action.revision, digest: action.digest, attemptId, workerId: "w",
+    }, at);
+
+    // An executor that throws before the effect started leaves nothing to
+    // reconcile: without a release the attempt stays claimed_pre_effect and
+    // every later drain retries it forever.
+    const service = new FollowupRecoveryService({
+      repository: store.assistantWork,
+      workerId: "w",
+      dispatch: async () => { throw new Error("executor exploded"); },
+      now: () => at,
+    });
+    await expect(service.recoverAttempt(attemptId)).rejects.toThrow(/executor exploded/);
+    expect(store.assistantWork.getAction(action.id)).toMatchObject({ state: "cancelled" });
+    expect(store.assistantWork.getAttempt(attemptId)?.state).toBe("cancelled");
+  } finally {
+    store.close();
+  }
+});
+
+test("the release does not cancel a claim that moved on before it ran", async () => {
+  const store = openStateStore(stateDbPath());
+  try {
+    const at = "2026-01-01T00:00:00.000Z";
+    const work = store.assistantWork.admitObservation({
+      source: "fixture", occurrenceKey: "cas", workKey: "cas", workTitle: "cas", observedAt: at,
+      evidence: {}, provenance: { principal: "system", channel: "fixture", subject: "cas", evidenceId: "cas" },
+    }, at).work;
+    const action = store.assistantWork.proposeAction({
+      workId: work.id, semanticKey: "cas", effectClass: "external_mutation",
+      recipient: "someone", topic: "topic", action: "unsupported_executor",
+      payload: { note: "no executor" },
+    }, at);
+    store.assistantWork.grantExplicitApproval({
+      actionId: action.id, revision: action.revision, digest: action.digest,
+      provenance: { principal: "owner", channel: "fixture", subject: "owner", evidenceId: "cas" },
+    }, at);
+    const attemptId = "cas-attempt";
+    store.assistantWork.claimForDispatch({
+      actionId: action.id, revision: action.revision, digest: action.digest, attemptId, workerId: "worker-a",
+    }, at);
+
+    // The attempt reached effect_started before the release ran, so the effect
+    // may already have touched the outside world: the release must decline
+    // rather than cancel a claim that is no longer pre-effect.
+    store.assistantWork.markEffectStarted({ attemptId, workerId: "worker-a" }, at);
+    const declined = store.assistantWork.releaseClaimedPreEffectAttempt({
+      actionId: action.id, revision: action.revision, digest: action.digest,
+      attemptId, workerId: "worker-a", reason: "pre_effect_dispatch_rejected",
+    }, at);
+    expect(declined.released).toBe(false);
+    expect(store.assistantWork.getAction(action.id)?.state).not.toBe("cancelled");
+    expect(store.assistantWork.getAttempt(attemptId)?.state).toBe("effect_started");
+
+    // The same call declines for a worker that does not own the claim.
+    const otherAttempt = "cas-other-attempt";
+    const other = store.assistantWork.proposeAction({
+      workId: work.id, semanticKey: "cas-2", effectClass: "external_mutation",
+      recipient: "someone", topic: "topic", action: "unsupported_executor",
+      payload: { note: "no executor either" },
+    }, at);
+    store.assistantWork.grantExplicitApproval({
+      actionId: other.id, revision: other.revision, digest: other.digest,
+      provenance: { principal: "owner", channel: "fixture", subject: "owner", evidenceId: "cas-2" },
+    }, at);
+    store.assistantWork.claimForDispatch({
+      actionId: other.id, revision: other.revision, digest: other.digest, attemptId: otherAttempt, workerId: "worker-a",
+    }, at);
+    expect(store.assistantWork.releaseClaimedPreEffectAttempt({
+      actionId: other.id, revision: other.revision, digest: other.digest,
+      attemptId: otherAttempt, workerId: "worker-b", reason: "pre_effect_dispatch_rejected",
+    }, at).released).toBe(false);
+    expect(store.assistantWork.getAction(other.id)?.state).not.toBe("cancelled");
+
+    // The owner's own release still works.
+    expect(store.assistantWork.releaseClaimedPreEffectAttempt({
+      actionId: other.id, revision: other.revision, digest: other.digest,
+      attemptId: otherAttempt, workerId: "worker-a", reason: "pre_effect_dispatch_rejected",
+    }, at).released).toBe(true);
+    expect(store.assistantWork.getAction(other.id)).toMatchObject({ state: "cancelled" });
+    expect(store.assistantWork.getAttempt(otherAttempt)?.state).toBe("cancelled");
+  } finally {
+    store.close();
+  }
 });

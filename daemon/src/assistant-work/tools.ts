@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import type { CustomTool } from "@gajae-code/coding-agent";
 import { Type } from "@gajae-code/coding-agent/extensibility/typebox";
 
-import type { AssistantWorkRepository } from "../store/assistant-work.ts";
+import { hasMaterialIntegrityViolation, type AssistantWorkRepository } from "../store/assistant-work.ts";
 import type { MonitorStore } from "../monitors/store.ts";
 import { createServiceMonitorTool } from "./monitoring.ts";
 import { assessObservation, type ObservationAssessment } from "./observation.ts";
@@ -409,6 +409,12 @@ function executionDetails(
     action: actionSummary(result.action),
     attempt: attemptSummary(result.attempt),
     evidence: result.evidence,
+    // The persisted outcome is authoritative and may be marked when material was
+    // rewritten mid-flight; hoisted so a consumer reading `evidence` alone still
+    // sees that this settlement does not describe the approved material.
+    ...(hasMaterialIntegrityViolation(result.attempt.outcome)
+      ? { materialIntegrityViolation: true }
+      : {}),
   };
 }
 

@@ -96,10 +96,27 @@ describe("monitor ingress triggers", () => {
 
     try {
       watcher.start();
+      // Native subscription startup is asynchronous on macOS. Observe a separate
+      // path before measuring the note.txt burst rather than losing that burst.
+      let nextProbeAt = 0;
+      await waitFor(() => {
+        if (received.some((event) => event.occurrenceKey?.startsWith(`watcher:${watched}:ready.txt:`))) return true;
+        if (Date.now() >= nextProbeAt) {
+          writeFileSync(join(watched, "ready.txt"), String(Date.now()));
+          nextProbeAt = Date.now() + 100;
+        }
+        return false;
+      });
+      const noteEvents = () => received.filter((event) => event.occurrenceKey?.startsWith(`watcher:${watched}:note.txt:`));
       writeFileSync(join(watched, "note.txt"), "one");
       writeFileSync(join(watched, "note.txt"), "two");
-      await waitFor(() => received.length === 1);
-      expect(received[0]).toMatchObject({ eventType: expect.stringMatching(/^watcher\./) });
+      await waitFor(() => noteEvents().length > 0);
+      await Bun.sleep(100);
+      expect(noteEvents()).toHaveLength(1);
+      expect(noteEvents()[0]).toMatchObject({
+        eventType: expect.stringMatching(/^watcher\./),
+        payload: { root: watched, path: "note.txt" },
+      });
     } finally {
       watcher.stop();
       store.close();
@@ -116,7 +133,10 @@ describe("monitor ingress triggers", () => {
     const monitor = monitors.create({
       id: "script-monitor",
       name: "Script",
-      trigger: { kind: "script", argv: ["emit.sh"], intervalMs: 1_000 },
+      // A long interval so the timer cannot fire during the test: the interval
+      // schedule is not what this test asserts, and waiting on the first tick
+      // made the test fail under load.
+      trigger: { kind: "script", argv: ["emit.sh"], intervalMs: 60_000 },
       instruction: "Report script output.",
     });
     const received: MonitorTriggerEvent[] = [];
@@ -128,7 +148,17 @@ describe("monitor ingress triggers", () => {
 
     try {
       scripts.start();
-      await waitFor(() => received.length === 1, 2_500);
+      // Drive the dispatch path directly instead of waiting on a timer: a
+      // bounded wait for the first tick is wall-clock dependent and flaked
+      // under load, and occurrence keys are clock-derived so counting them
+      // proves nothing.
+      await scripts.runOnce(monitor);
+      expect(received).toHaveLength(1);
+      // Concurrent runs of one monitor must still produce exactly one sink
+      // event, which is the real no-double-dispatch invariant.
+      const before = received.length;
+      await Promise.all([scripts.runOnce(monitor), scripts.runOnce(monitor), scripts.runOnce(monitor)]);
+      expect(received.length - before).toBe(1);
       expect(received[0]).toMatchObject({
         eventType: "script",
         payload: expect.objectContaining({ exitCode: 0, stdout: "monitor-script-ok" }),

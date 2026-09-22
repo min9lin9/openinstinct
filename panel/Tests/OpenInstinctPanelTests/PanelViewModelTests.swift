@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 @testable import OpenInstinctPanel
 
 @MainActor
@@ -6,6 +7,14 @@ enum PanelViewModelChecks {
     static func run() async -> [String] {
         var failures = await revisionConflictCheck()
         failures.append(contentsOf: await daemonAbsentCheck())
+        failures.append(contentsOf: await stuckRefreshCheck())
+        failures.append(contentsOf: await cancelledRefreshCheck())
+        failures.append(contentsOf: await forcePreemptsRecoveryCheck())
+        failures.append(contentsOf: await uncertainResetCheck())
+        failures.append(contentsOf: await recoveryDeadlineCheck())
+        failures.append(contentsOf: await silentSocketCheck())
+        failures.append(contentsOf: await supersededRefreshCheck())
+        failures.append(contentsOf: await stuckKickstartCheck())
         return failures
     }
 
@@ -63,6 +72,275 @@ enum PanelViewModelChecks {
         return failures
     }
 
+    private static func silentSocketCheck() async -> [String] {
+        do {
+            // A unique test-only socket accepts connections at the kernel level
+            // but never negotiates. It never connects to the installed daemon.
+            let socket = try SilentControlSocket()
+            defer { socket.close() }
+            let transport = UnixSocketTransport(socketPath: socket.path, requestTimeout: 50_000_000)
+            var failures: [String] = []
+            for _ in 0..<2 {
+                do {
+                    _ = try await transport.request(.statusGet(id: UUID().uuidString))
+                    failures.append("silent control socket unexpectedly completed status.get")
+                } catch ControlTransportError.timedOut {
+                    // Both attempts must time out: the actor remains reusable.
+                } catch {
+                    failures.append("silent socket returned \(error) instead of a bounded timeout")
+                }
+            }
+            do {
+                _ = try await transport.subscribe()
+                failures.append("silent control socket unexpectedly completed subscription setup")
+            } catch ControlTransportError.timedOut {
+                // The setup deadline must not apply to the later live stream.
+            } catch {
+                failures.append("silent subscription returned \(error) instead of a bounded timeout")
+            }
+            let cancellable = UnixSocketTransport(socketPath: socket.path, requestTimeout: 2_000_000_000)
+            let request = Task { try await cancellable.request(.statusGet(id: "cancel")) }
+            try await Task.sleep(nanoseconds: 20_000_000)
+            let started = ContinuousClock.now
+            request.cancel()
+            do {
+                _ = try await request.value
+                failures.append("cancelled socket request returned success")
+            } catch is CancellationError {
+                if ContinuousClock.now - started > .seconds(1) {
+                    failures.append("socket cancellation waited for the request deadline")
+                }
+            } catch {
+                failures.append("socket cancellation surfaced as \(error) instead of cancellation")
+            }
+            return failures
+        } catch {
+            return ["could not create the silent socket regression fixture: \(error)"]
+        }
+    }
+
+    private static func stuckRefreshCheck() async -> [String] {
+        let transport = RecoveryTransport(holdStatus: true)
+        let model = PanelViewModel(transport: transport, requestTimeout: 20_000_000)
+        let started = ContinuousClock.now
+        await model.refreshStatus()
+        var failures: [String] = []
+        if ContinuousClock.now - started > .seconds(1) {
+            failures.append("stuck refresh exceeded its request deadline")
+        }
+        if model.connectionError?.contains("timed out") != true {
+            failures.append("stuck refresh did not expose the timeout honestly")
+        }
+        if health(for: model).title != "Not responding" {
+            failures.append("a control timeout falsely claimed the daemon was not running")
+        }
+        await transport.stopHoldingStatus()
+        await model.refreshStatus()
+        if model.connectionState != .connected || model.connectionError != nil {
+            failures.append("a timed-out request prevented the next refresh from succeeding")
+        }
+        await transport.releaseStatus(failing: true)
+        for _ in 0..<20 { await Task.yield() }
+        if model.connectionState != .connected || model.connectionError != nil {
+            failures.append("late failure of a timed-out refresh overwrote newer status")
+        }
+        return failures
+    }
+
+    private static func cancelledRefreshCheck() async -> [String] {
+        let transport = RecoveryTransport()
+        let model = PanelViewModel(transport: transport, requestTimeout: 2_000_000_000)
+        await model.refreshStatus()
+        await transport.startHoldingStatus()
+        let refresh = Task { await model.refreshStatus() }
+        guard await eventually({ await transport.pendingStatusCount() == 1 }) else {
+            refresh.cancel()
+            await transport.releaseStatus(failing: true)
+            return ["cancelled refresh fixture never received the status request"]
+        }
+        let started = ContinuousClock.now
+        refresh.cancel()
+        await refresh.value
+        var failures: [String] = []
+        if ContinuousClock.now - started > .seconds(1) {
+            failures.append("refresh cancellation waited for an uncooperative transport")
+        }
+        if model.connectionState != .connected || model.connectionError != nil {
+            failures.append("closing the popover marked a healthy daemon absent")
+        }
+        await transport.releaseStatus(failing: true)
+        return failures
+    }
+
+    private static func supersededRefreshCheck() async -> [String] {
+        let transport = RecoveryTransport(holdStatus: true)
+        let kickstarts = KickstartRecorder()
+        let model = PanelViewModel(
+            transport: transport,
+            daemonKickstart: { await kickstarts.record() },
+            requestTimeout: 2_000_000_000
+        )
+        var failures: [String] = []
+        for recover in [false, true] {
+            await transport.startHoldingStatus()
+            let old = Task { await model.refreshStatus() }
+            guard await eventually({ await transport.pendingStatusCount() == 1 }) else {
+                old.cancel()
+                await transport.releaseAll()
+                await old.value
+                return ["superseded refresh fixture did not receive its request"]
+            }
+            await transport.stopHoldingStatus()
+            if recover { await model.forceRestartAndReset() }
+            else { await model.refreshStatus() }
+            let notice = model.notice
+            await transport.releaseStatus(failing: true)
+            await old.value
+            if model.connectionState != .connected || model.connectionError != nil || model.notice != notice {
+                failures.append("older refresh overwrote \(recover ? "force recovery" : "newer refresh") state")
+            }
+            if recover && model.status?.session.mainSessionId != "fresh" {
+                failures.append("older refresh replaced the fresh conversation status")
+            }
+        }
+        return failures
+    }
+
+    private static func stuckKickstartCheck() async -> [String] {
+        let transport = RecoveryTransport()
+        let kickstarts = KickstartRecorder(hold: true)
+        let model = PanelViewModel(
+            transport: transport,
+            daemonKickstart: { await kickstarts.record() },
+            requestTimeout: 50_000_000
+        )
+        await model.forceRestartAndReset()
+        var failures: [String] = []
+        if model.recoveryInProgress || model.notice?.contains("timed out") != true {
+            failures.append("stuck kickstart kept recovery busy or hid the timeout")
+        }
+        await kickstarts.release()
+        for _ in 0..<20 { await Task.yield() }
+        if await transport.resetCount() != 0 {
+            failures.append("expired kickstart continued into a destructive reset")
+        }
+        return failures
+    }
+
+    private static func forcePreemptsRecoveryCheck() async -> [String] {
+        let transport = RecoveryTransport(holdRestart: true, holdReset: true)
+        let kickstarts = KickstartRecorder()
+        let model = PanelViewModel(
+            transport: transport,
+            daemonKickstart: { await kickstarts.record() },
+            requestTimeout: 2_000_000_000
+        )
+        await model.refreshStatus()
+        let normal = Task { await model.restartDaemon() }
+        guard await eventually({ await transport.restartCount() == 1 }) else {
+            await transport.releaseAll()
+            await normal.value
+            return ["normal recovery fixture did not receive daemon.restart"]
+        }
+        let force = Task { await model.forceRestartAndReset() }
+        guard await eventually({ await transport.resetCount() == 1 }) else {
+            await transport.releaseAll()
+            await force.value
+            await normal.value
+            return ["force was ignored or waited for the hung normal recovery"]
+        }
+        let duplicate = Task { await model.forceRestartAndReset() }
+        for _ in 0..<20 { await Task.yield() }
+        let workingNotice = model.notice
+        // Complete the superseded request while the force reset is still held.
+        await transport.releaseRestart()
+        await normal.value
+        var failures: [String] = []
+        if !model.recoveryInProgress || model.notice != workingNotice {
+            failures.append("superseded recovery overwrote the newer recovery's progress or notice")
+        }
+        if await kickstarts.count() != 1 {
+            failures.append("force did not use exactly one out-of-band kickstart")
+        }
+        if await transport.resetCount() != 1 {
+            failures.append("repeated force clicks issued duplicate destructive resets")
+        }
+        await transport.releaseAll()
+        await force.value
+        await duplicate.value
+        if model.recoveryInProgress || model.status?.session.mainSessionId != "fresh" {
+            failures.append("force recovery did not finish with the fresh session")
+        }
+        if model.notice != "Fresh conversation started. Your memory and settings are safe." {
+            failures.append("late normal recovery completion replaced force recovery success")
+        }
+        if await transport.restartCount() != 1 {
+            // The force path must never re-enter the hung daemon.restart route.
+            failures.append("force recovery retried daemon.restart")
+        }
+        let finalKickstarts = await kickstarts.count()
+        let finalResets = await transport.resetCount()
+        if finalKickstarts != 1 || finalResets != 1 {
+            failures.append("force completion scheduled an extra kickstart or reset")
+        }
+        return failures
+    }
+
+    private static func uncertainResetCheck() async -> [String] {
+        let transport = RecoveryTransport(holdReset: true)
+        let kickstarts = KickstartRecorder()
+        let model = PanelViewModel(
+            transport: transport,
+            daemonKickstart: { await kickstarts.record() },
+            requestTimeout: 20_000_000
+        )
+        await model.forceRestartAndReset()
+        var failures: [String] = []
+        if model.recoveryInProgress || model.notice?.contains("no reset was retried") != true {
+            failures.append("uncertain reset did not finish with an honest non-retry notice")
+        }
+        if await transport.resetCount() != 1 || model.notice?.contains("timed out") != true {
+            failures.append("ambiguous reset timeout was retried or hidden")
+        }
+        let notice = model.notice
+        await transport.releaseAll()
+        for _ in 0..<20 { await Task.yield() }
+        if model.notice != notice {
+            failures.append("late reset acknowledgement changed the reported recovery outcome")
+        }
+        return failures
+    }
+
+    private static func recoveryDeadlineCheck() async -> [String] {
+        let transport = RecoveryTransport(holdStatus: true)
+        let kickstarts = KickstartRecorder()
+        let model = PanelViewModel(
+            transport: transport,
+            daemonKickstart: { await kickstarts.record() },
+            requestTimeout: 2_000_000_000,
+            recoveryTimeout: 20_000_000
+        )
+        await model.forceRestartAndReset()
+        var failures: [String] = []
+        if model.recoveryInProgress || model.notice?.contains("timed out") != true {
+            failures.append("recovery's overall deadline did not release the UI with a timeout")
+        }
+        await transport.releaseAll()
+        for _ in 0..<20 { await Task.yield() }
+        if await transport.resetCount() != 0 {
+            failures.append("expired recovery continued into a destructive reset")
+        }
+        return failures
+    }
+
+    private static func eventually(_ predicate: @escaping @Sendable () async -> Bool) async -> Bool {
+        for _ in 0..<500 {
+            if await predicate() { return true }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        return false
+    }
+
     private static func monitor(id: String, enabled: Bool, revision: Int) -> Monitor {
         Monitor(
             id: id,
@@ -86,6 +364,155 @@ private enum StubTransportError: Error, LocalizedError, Sendable {
 
     var errorDescription: String? {
         "socket unavailable"
+    }
+}
+
+/// No accept loop is needed: connected clients can send into the backlog, but
+/// no server code ever reads or replies. Four requests fit in the backlog.
+private final class SilentControlSocket {
+    let path = "/tmp/oi-panel-\(UUID().uuidString).sock"
+    private var descriptor: Int32 = -1
+
+    init() throws {
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw StubTransportError.unavailable }
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+        let bytes = path.utf8CString.map { UInt8(bitPattern: $0) }
+        withUnsafeMutableBytes(of: &address.sun_path) { $0.copyBytes(from: bytes) }
+        let bound = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard bound == 0, Darwin.listen(fd, 8) == 0 else {
+            Darwin.close(fd)
+            if bound == 0 { Darwin.unlink(path) }
+            throw StubTransportError.unavailable
+        }
+        descriptor = fd
+    }
+
+    func close() {
+        guard descriptor >= 0 else { return }
+        Darwin.close(descriptor)
+        descriptor = -1
+        Darwin.unlink(path)
+    }
+
+    deinit { close() }
+}
+
+private actor KickstartRecorder {
+    private var calls = 0
+    private var hold: Bool
+    private var waiter: CheckedContinuation<Void, Never>?
+    init(hold: Bool = false) { self.hold = hold }
+    func record() async {
+        calls += 1
+        if hold { await withCheckedContinuation { waiter = $0 } }
+    }
+    func release() {
+        hold = false
+        waiter?.resume()
+        waiter = nil
+    }
+    func count() -> Int { calls }
+}
+
+/// Deliberately ignores cancellation until explicitly released. This proves a
+/// deadline and newer recovery do not rely on cooperative transport callbacks.
+private actor RecoveryTransport: ControlTransport {
+    private var holdStatus: Bool
+    private var holdRestart: Bool
+    private var holdReset: Bool
+    private var statusWaiters: [CheckedContinuation<ControlFrame, Error>] = []
+    private var restartWaiters: [CheckedContinuation<ControlFrame, Error>] = []
+    private var resetWaiters: [CheckedContinuation<ControlFrame, Error>] = []
+    private var restarts = 0
+    private var resets = 0
+    private var sessionID = "main"
+
+    init(holdStatus: Bool = false, holdRestart: Bool = false, holdReset: Bool = false) {
+        self.holdStatus = holdStatus
+        self.holdRestart = holdRestart
+        self.holdReset = holdReset
+    }
+
+    func request(_ request: ControlRequest) async throws -> ControlFrame {
+        switch request {
+        case .statusGet:
+            if holdStatus {
+                return try await withCheckedThrowingContinuation { statusWaiters.append($0) }
+            }
+            return statusFrame()
+        case .daemonRestart:
+            restarts += 1
+            if holdRestart {
+                return try await withCheckedThrowingContinuation { restartWaiters.append($0) }
+            }
+            return restartFrame()
+        case .sessionReset:
+            resets += 1
+            sessionID = "fresh"
+            if holdReset {
+                return try await withCheckedThrowingContinuation { resetWaiters.append($0) }
+            }
+            return resetFrame()
+        default:
+            throw StubTransportError.unavailable
+        }
+    }
+
+    func subscribe() async throws -> ChatSubscription { throw StubTransportError.unavailable }
+    func pendingStatusCount() -> Int { statusWaiters.count }
+    func restartCount() -> Int { restarts }
+    func resetCount() -> Int { resets }
+    func startHoldingStatus() { holdStatus = true }
+    func stopHoldingStatus() { holdStatus = false }
+
+    func releaseStatus(failing: Bool = false) {
+        holdStatus = false
+        let waiters = statusWaiters
+        statusWaiters = []
+        for waiter in waiters {
+            if failing { waiter.resume(throwing: StubTransportError.unavailable) }
+            else { waiter.resume(returning: statusFrame()) }
+        }
+    }
+
+    func releaseRestart() {
+        holdRestart = false
+        let waiters = restartWaiters
+        restartWaiters = []
+        for waiter in waiters { waiter.resume(returning: restartFrame()) }
+    }
+
+    func releaseAll() {
+        releaseStatus()
+        releaseRestart()
+        holdReset = false
+        let waiters = resetWaiters
+        resetWaiters = []
+        for waiter in waiters { waiter.resume(returning: resetFrame()) }
+    }
+
+    private func statusFrame() -> ControlFrame {
+        .response(.status(id: "status", payload: StatusResponsePayload(
+            bootstrap: BootstrapStatus(state: .running, remediation: "", probes: [:]),
+            session: SessionStatus(state: .active, mainSessionId: sessionID, mainSessionFilePresent: true, paused: false),
+            activeChildren: [], monitors: [], settings: SettingsStatus(),
+            imessage: ImessageLaneStatus(state: .detached)
+        )))
+    }
+
+    private func restartFrame() -> ControlFrame {
+        .response(.daemonRestart(id: "restart", payload: DaemonRestartResponsePayload(restarting: true)))
+    }
+
+    private func resetFrame() -> ControlFrame {
+        .response(.sessionReset(id: "reset", payload: SessionResetResponsePayload(reset: true, sessionId: "fresh")))
     }
 }
 

@@ -199,6 +199,140 @@ Every `children.*` limit is restart-scoped. The panel writes milliseconds for
 `*Ms` keys and restarts Gajae after saving; direct config edits need a daemon
 restart as well.
 
+## Agent email, peer coordination, and outbound calls
+
+These three capabilities are off unless configured. Every value below goes in
+the daemon's private `~/.openinstinct/env` file (`KEY=value`, mode 0600) and is
+read at daemon start; none of them can be set from a prompt or the panel.
+
+### The agent's own email address
+
+```
+OI_AGENT_EMAIL_ADDRESS=gajae@yourdomain.example
+OI_AGENT_EMAIL_SEND_ORIGIN=https://api.mailprovider.example
+OI_AGENT_EMAIL_SEND_PATH=/v1/send
+OI_AGENT_EMAIL_INBOX_URL=https://api.mailprovider.example/v1/inbox
+OI_AGENT_EMAIL_SECRET_REF=secret://agent-mail
+OI_HTTP_SECRET_BINDINGS={"secret://agent-mail":{"origin":"https://api.mailprovider.example","header":"Authorization","environment":"AGENT_MAIL_TOKEN"}}
+AGENT_MAIL_TOKEN=<provider api token>
+```
+
+**Required provider contract.** The send endpoint must accept a JSON body of
+exactly `{clientReference, from, to, subject, text}`, and
+`GET <send path>?clientReference=<ref>` must return `acceptedReference` set to
+that same reference **only when the message was actually accepted**. That one
+field carries both correlation and success: a generic `{"accepted":true}` proves
+nothing about *this* message, and an echoed reference next to a failure would
+otherwise confirm a send that never happened. Anything else leaves the send
+`ambiguous`. Point these variables at an adapter implementing
+that contract.
+
+`OI_AGENT_EMAIL_ADDRESS` alone enables the `agent_email` tool; if it is set and
+any other field is missing or malformed the daemon fails to start rather than
+sending from a half-configured identity. You do not write a message binding for
+this capability: the agent-email tool authorizes only plans it can rebuild
+byte-for-byte from the identity, and no email template is added to
+`OI_HTTP_MESSAGE_BINDINGS`, so `assistant_managed_http` can never obtain
+agent-email classification for a request it composed. The credential binding is
+checked at startup too — a missing `OI_HTTP_SECRET_BINDINGS` entry, a binding pointing at a
+different origin or header, an empty token, or a plaintext `http://` origin
+that is not BOTH listed in `OI_HTTP_LOCAL_ORIGINS` and a literal loopback or
+private address all abort boot instead of failing after the owner has already
+approved a send. A listed DNS name is refused for plaintext even when it
+resolves privately today, because dispatch decides by the address resolved at
+request time and that can change. You only supply the credential binding, so the token never appears in a
+prompt, a URL, or an action payload.
+
+Mail bodies pass the managed-HTTP plaintext-credential heuristic: a body that
+looks like it carries a literal secret is refused before the action is stored,
+so a message quoting a token or password-like string will not send. That is
+deliberate — credentials belong in `secret://` references, never in a request
+body — but it means some legitimate prose is refused; rephrase rather than
+trying to route around it.
+
+A send is an `external_message` action: it is proposed first, then executed only
+against the exact action ID, revision, and digest, authorized either by an exact
+`/allow-send` rule for that recipient and subject or by `/approve`. Inbound mail
+is admitted as third-party evidence only; it can open work but never authorizes
+an action.
+
+### Trusted peers
+
+Peer coordination has no env config. The allow-list lives in the `trusted_peers`
+table and is empty until you add an entry, so the lane is inert by default, and
+the `peer_coordinate` tool then reports that instead of guessing a recipient.
+
+Enrollment and revocation are operator actions on the control socket, never
+model tool calls, because they move the trust boundary:
+
+```
+peers.list    {}
+peers.upsert  {"handle":"+15550000002","displayName":"Alex","relation":"household"}
+peers.revoke  {"handle":"+15550000002"}
+```
+
+`relation` is one of `household`, `colleague`, `professional`, `business`.
+Handles are normalized with the same rule as the owner allow-list, so a peer is
+identified identically by the trust check and the lookup. Revoking keeps the row
+and its history but stops admission immediately, and also stops an
+already-approved outbound envelope: trust is rechecked at the send boundary, not
+only when the envelope was proposed. A
+non-owner iMessage row is never an owner turn: it is either one admitted
+coordination envelope from a `trusted` peer or it is dropped with
+`allowlist_dropped`. Admissions log `peers/envelope_admitted`; a revoked peer is
+ignored without deleting its history. A peer envelope carries a single-use
+nonce and the managed dispatcher has no peer repeat executor, so `/followup`
+repeat policies are refused for peer sends: a recurring arrangement is a fresh
+proposal each time. The same refusal applies to agent email and agent calls,
+whose verification is bound to one correlation reference.
+
+The ledger also binds an action's material to the digest the owner approved. It
+recomputes that digest at dispatch claim and on resume, and refuses a mismatch
+there with `stale_digest` — so an action edited after approval cannot execute
+under that approval. It also recomputes before materializing a repeat (which
+clears the due marker and reports `policy_changed`) and before resolving an
+ambiguity (which refuses the resolution outright). A settlement recorded while material no
+longer matches is still stored (the effect already happened) but is marked
+`materialIntegrityViolation`, and such a confirmation never grants authority to
+complete work or to widen a later install. An attempt left `claimed_pre_effect`
+by a crash is cancelled rather than retried forever — whether its dispatch is
+rejected or the executor throws before the effect starts; re-propose it.
+
+### Outbound calls (Concierge equivalent)
+
+```
+OI_AGENT_CALL_ORIGIN=https://api.telephony.example
+OI_AGENT_CALL_CREATE_PATH=/v1/calls
+OI_AGENT_CALL_STATUS_PATH=/v1/calls/status
+OI_AGENT_CALL_CALLER_ID=+15550000001
+OI_AGENT_CALL_SECRET_REF=secret://agent-calls
+OI_HTTP_SECRET_BINDINGS={"secret://agent-calls":{"origin":"https://api.telephony.example","header":"Authorization","environment":"AGENT_CALL_TOKEN"}}
+AGENT_CALL_TOKEN=<provider api token>
+```
+
+**Required provider contract.** The create endpoint must accept a JSON body of
+exactly `{clientReference, from, to, purpose, script, maxMinutes}`, and
+`GET <status path>?clientReference=<ref>` must return `placedReference` set to
+that same reference **only when that call was actually placed**. A status
+endpoint that only reports `{"status":"placed"}` can never confirm, because
+another call's placed status would otherwise confirm this billable one, and a
+correlated `not_placed` must not confirm either. An unmatched, unsuccessful, or
+stale response settles `ambiguous`.
+
+`OI_AGENT_CALL_ORIGIN` alone enables the `agent_call` tool; a partial
+configuration is a startup error, as is a credential binding that does not
+resolve for the create endpoint or a non-local plaintext `http://` origin. Every call is an `external_mutation`, so it
+always requires an authenticated `/approve` for that exact identity — a send
+rule cannot authorize a call, by construction. The proposal states the callee,
+purpose, script, and minute cap (1–30) so the approval prompt is legible.
+A provider 5xx settles `definitive_failed` without a second attempt; a hang
+settles `ambiguous` and is reported as `uncertain` and never auto-retried.
+Reconcile such a call with the provider's own call log before re-proposing.
+
+One `OI_HTTP_SECRET_BINDINGS` object holds every reference, so merge the mail
+and telephony entries into a single JSON object rather than setting the variable
+twice.
+
 ## Gajae's own Chrome profile
 
 The browser tool never touches the owner's personal Chrome. Every browser
@@ -440,27 +574,78 @@ state-db edit is not an adapter flip.
 
 ## Live acceptance procedure
 
-After granting TCC and preparing a second iMessage handle, run:
+After granting TCC, attaching the owner iMessage handle, and building the panel,
+choose a fresh token and send it from the allowlisted owner device while the
+harness waits. `OI_ACCEPTANCE_SECOND_HANDLE` must be that allowlisted sender,
+not an unrelated second account:
 
 ```sh
 OI_ACCEPTANCE_SECOND_HANDLE='+15550000002' \
-OI_ACCEPTANCE_SEND=1 \
+OI_ACCEPTANCE_INBOUND_TOKEN='unique-token-for-this-run' \
 bun scripts/acceptance/run-acceptance.ts
 ```
 
-The harness prints `AC-1` through `AC-10`, evidence lines, and
-`METRIC acceptance_pass=<n>/10`. It never treats absent prerequisites as a
-pass. A scenario requiring a grant, a built panel, a second device, an explicit
-operator-selected monitor, or a known child id prints `SKIP(reason)` instead.
+The harness prints `AC-1` through `AC-11`, evidence lines, and
+`METRIC acceptance_pass=<n>/11`. Missing prerequisites produce `SKIP`, not a
+pass; observed receipt or behavior failures remain `FAIL`. The command above
+does not authorize monitor toggles or daemon restarts. Use `--wait-seconds N`,
+`--socket PATH`, `--home PATH`, and `--panel-app PATH` to target the intended
+instance and wait window.
 
-For AC-7, choose a monitor that may be momentarily toggled and set
-`OI_ACCEPTANCE_MONITOR_ID=<id>`; the harness restores its original state. For
-AC-8, choose a unique token, set `OI_ACCEPTANCE_INBOUND_TOKEN=<token>`, and
-send exactly that token from the second device while the harness waits. For
-AC-9, ask the real owner chat to create a delegated background task, then set
-`OI_ACCEPTANCE_CHILD_ID=<child-id>` after admission. `--wait-seconds N`,
-`--socket PATH`, `--home PATH`, and `--panel-app PATH` make the harness
-explicitly target the operator's intended instance.
+- **AC-1 — owner round trip:** requires the sender handle and inbound token
+  above, access to `chat.db`, an attached owner handle, and a confirmed reply
+  ledger entry for the matching inbound message.
+- **AC-2 — background handoff:** delegate work from the owner chat and set
+  `OI_ACCEPTANCE_CHILD_ID=<child-id>` once its first turn has settled idle/cold
+  or terminal with a delivered first receipt. Admission alone is insufficient.
+- **AC-3 — scheduled monitor delivery:** author a cron monitor from the owner
+  chat, let it fire on schedule, and set `OI_ACCEPTANCE_MONITOR_ID=<id>` to
+  inspect its dispatch and delivery evidence. A daemon-seeded monitor does not
+  satisfy this criterion.
+- **AC-4 — memory lifecycle:** checks the existing memory corpus, Git receipts,
+  and structural audit; AC-6 additionally checks memory survival across restart.
+- **AC-5 — panel supervision:** checks the installed panel executable, daemon
+  status, active-child count, and monitor listing. Setting
+  `OI_ACCEPTANCE_MONITOR_ID=<id>` explicitly authorizes toggling and restoring
+  that monitor using revision fencing. Choose an unprotected monitor that may
+  safely be momentarily toggled; the same variable also selects AC-3 evidence.
+  Protected selections fail before mutation. Without a selection, or when the
+  selected monitor is absent, AC-5 reports `SKIP` with the partial status/panel
+  evidence rather than claiming toggle coverage. Listing monitors is not proof
+  of a successful toggle or of panel UI interaction.
+- **AC-6 — restart resume:** `OI_ACCEPTANCE_RESTART=1` authorizes killing and
+  relaunching the live daemon to check the existing main session resumes.
+- **AC-7 — visible turn failure:** checks existing confirmed `[turn failed]`
+  replies; it does not itself induce an overlong or blocked turn.
+- **AC-8 — threaded reply:** checks existing confirmed reply-linked deliveries
+  against actual thread placement in `chat.db`. A ledger receipt alone, including
+  a synthetic AppleScript message id, is not proof of thread placement.
+- **AC-9 — images both ways:** checks the latest matching owner image for a
+  confirmed turn reply and existing non-degraded outbound file deliveries. Send
+  an owner image and ask for an image back beforehand; the harness does not
+  generate that traffic or wait for a missing image reply in this scenario.
+- **AC-10 — stranger silence:** checks existing non-allowlisted inbound traffic
+  within the daemon's processed cursor window for absence of reply/turn evidence.
+- **AC-11 — conversational child:** requires `OI_ACCEPTANCE_CHILD_ID`, a unique
+  `OI_ACCEPTANCE_TOKEN`, and `OI_ACCEPTANCE_RESTART=1`. Prepare an idle/cold
+  child with a delivered first receipt, a completed nudge turn, session prompt
+  hash evidence, and persisted `report_progress` containing that token. Have it
+  report again so the harness can observe an undelivered interim window before
+  SIGKILL. After restart, send the token from the owner device to nudge/resume
+  that child; the harness checks the new token-bearing turn. The optional
+  `OI_ACCEPTANCE_ORPHAN=1` branch deletes the child's persisted session file
+  and verifies orphan recovery instead; this is destructive, not a routine
+  prerequisite.
+
+This is a mixed evidence harness, not eleven fresh end-to-end interactions.
+In particular, AC-7/8/9 inspect historical records without a deployment-time or
+run-token fence, so running them after deployment does not prove the deployed
+version produced those records. AC-1 also searches existing messages for its
+token; use a genuinely new token and correlate post-deployment inbound and
+reply evidence for a fresh live test. AC-2/3 require prepared historical child
+or monitor evidence. AC-6/11 perform live restart actions only when explicitly
+authorized. Preserve failures and missing receipts; do not relabel historical
+successes as fresh deployment coverage.
 
 ## Memory quarantine recovery
 

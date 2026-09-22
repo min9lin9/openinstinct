@@ -46,6 +46,9 @@ public enum ControlCapability: String, Codable, Sendable, Equatable {
     case sessionCompactStatus = "session.compact.status"
     case maintenanceRun = "maintenance.run"
     case memoryBackfillCaptures = "memory.backfillCaptures"
+    case peersList = "peers.list"
+    case peersUpsert = "peers.upsert"
+    case peersRevoke = "peers.revoke"
 }
 
 public enum ControlErrorCode: String, Codable, Sendable, Equatable {
@@ -583,6 +586,8 @@ public enum ControlRequest: Codable, Sendable, Equatable {
         case .memoryBackfillCaptures:
             _ = try container.decode(EmptyPayload.self, forKey: .payload)
             self = .memoryBackfillCaptures(id: id)
+        case .peersList, .peersUpsert, .peersRevoke:
+            throw ControlCodecError.invalidFrame("panel does not implement requests for \(verb.rawValue)")
         }
     }
 

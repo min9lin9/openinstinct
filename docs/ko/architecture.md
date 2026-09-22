@@ -98,7 +98,7 @@ SDK 관리형 gate는 메인과 자식 세션의 raw `bash`, 변경형 browser �
 /reject ACTION_ID REVISION DIGEST
 ```
 
-`DIGEST`는 소문자 16진수 64자입니다. 알 수 없는 액션, 낡은 리비전/digest, 추가 문구는 거부됩니다. 승인 인식은 관리형 local-file 액션을 식별하고, 저장된 install/HTTP/opaque payload 구조를 검증합니다. 웹페이지, 메시지, 모니터, 자식, 메모리, 툴 출력, 모델의 판단은 소유자 승인이 아닙니다. `/reject`는 해당 현재 리비전을 실행하지 않고 취소합니다. `/approve`는 정확한 승인 하나를 기록한 뒤 직접 소유자 명령을 MainSession에 넘깁니다. 모델은 같은 ID/리비전/digest로 해당 관리형 executor를 호출하거나, opaque 액션이면 동일한 raw 툴 입력을 딱 한 번 다시 시도해야 합니다. 완료 여부는 명령 자체가 아니라 내구성 있는 executor 결과로만 결정됩니다.
+`DIGEST`는 소문자 16진수 64자입니다. 알 수 없는 액션, 낡은 리비전/digest, 추가 문구는 거부됩니다. 승인 인식은 관리형 local-file 액션을 식별하고, 저장된 install/HTTP/opaque/peer-envelope payload 구조를 검증합니다(peer envelope은 `isPeerEnvelopeAction`으로 검증하며, 디코딩 가능한 envelope의 handle과 thread key가 액션의 recipient/topic과 일치해야 합니다). 웹페이지, 메시지, 모니터, 자식, 메모리, 툴 출력, 모델의 판단은 소유자 승인이 아닙니다. `/reject`는 해당 현재 리비전을 실행하지 않고 취소합니다. `/approve`는 정확한 승인 하나를 기록한 뒤 직접 소유자 명령을 MainSession에 넘깁니다. 모델은 같은 ID/리비전/digest로 해당 관리형 executor를 호출하거나, opaque 액션이면 동일한 raw 툴 입력을 딱 한 번 다시 시도해야 합니다. 완료 여부는 명령 자체가 아니라 내구성 있는 executor 결과로만 결정됩니다.
 
 외부 메시지의 재사용 가능한 규칙은 첨부 없는 독립된 한 줄의 정확한 명령을 씁니다.
 
@@ -123,8 +123,28 @@ JSON에는 wildcard 없이 정확히 세 필드만 허용됩니다. 규칙은 �
 
 ### 관리형 HTTP 호스트 정책
 
-`main.ts`는 `configuredHttpAccess()`와 함께 관리형 HTTP 툴을 등록합니다. `OI_HTTP_LOCAL_ORIGINS`는 private/local 주소 해석을 허용할 정확한 `scheme://host[:port]` origin의 JSON 배열이며, cloud metadata endpoint는 항상 차단됩니다. `OI_HTTP_SECRET_BINDINGS`는 호스트가 소유하는 JSON 객체로, 각 reference 값에는 정확히 `origin`, `header`, `environment`가 있어야 합니다(예: `{"mailApi":{"origin":"https://api.example","header":"Authorization","environment":"MAIL_API_TOKEN"}}`). 툴 호출은 비밀 값이 아니라 `mailApi` 같은 `secretRef`만 전달합니다. 데몬은 지정된 환경 변수 값을 스냅샷하고 origin과 header가 모두 정확히 맞을 때만 풉니다. 민감한 header, query parameter, body key에는 평문 자격 증명을 넣을 수 없습니다. 공용 평문 HTTP로 secret reference를 보낼 수 없고, redirect를 따라가지 않으며, DNS 결과를 검증해 연결 주소를 고정합니다. 변경 뒤 별도 GET이 기대 상태를 입증하지 못하면 성공이 아니라 `ambiguous`입니다.
+`main.ts`는 `configuredHttpAccess()`와 함께 관리형 HTTP 툴을 등록합니다. `OI_HTTP_LOCAL_ORIGINS`는 private/local 주소 해석을 허용할 정확한 `scheme://host[:port]` origin의 JSON 배열이며, cloud metadata endpoint는 항상 차단됩니다. `OI_HTTP_SECRET_BINDINGS`는 호스트가 소유하는 JSON 객체로, 각 reference 값에는 정확히 `origin`, `header`, `environment`가 있어야 합니다(예: `{"secret://mail-api":{"origin":"https://api.example","header":"Authorization","environment":"MAIL_API_TOKEN"}}`). 툴 호출은 비밀 값이 아니라 `secret://mail-api` 같은 `secretRef`만 전달합니다. 데몬은 지정된 환경 변수 값을 스냅샷하고 origin과 header가 모두 정확히 맞을 때만 풉니다. 민감한 header, query parameter, body key에는 평문 자격 증명을 넣을 수 없습니다. 공용 평문 HTTP로 secret reference를 보낼 수 없고, redirect를 따라가지 않으며, DNS 결과를 검증해 연결 주소를 고정합니다. 변경 뒤 별도 GET이 기대 상태를 입증하지 못하면 성공이 아니라 `ambiguous`입니다.
 호스트 운영자는 이 값을 데몬의 비공개 `~/.openinstinct/env` 파일에 `KEY=value` 형식으로 넣고 mode 0600을 유지합니다. 프롬프트 내용은 이 호스트 정책을 바꿀 수 없습니다.
+
+### 에이전트 자신의 이메일 신원
+
+`configuredAgentEmail()`(`daemon/src/email/identity.ts`)은 `OI_AGENT_EMAIL_ADDRESS`가 설정된 경우에만 신원을 반환합니다. 주소가 있는데 나머지 필드가 빠지거나 잘못되면 조용히 기능을 낮추지 않고 부팅을 실패시킵니다. 신원은 발송 origin/path, 받은편지함 URL, 그리고 자격 증명을 나르는 `secretRef`를 지정하며 자격 증명 자체는 담지 않습니다.
+
+발송은 관리형 HTTP 효과를 타므로 에이전트 이메일도 다른 모든 외부 효과와 같은 원장의 `external_message` 액션 하나입니다. 정확한 본문(`clientReference`, `from`, `to`, `subject`, `text`), 같은 reference에 대해 `acceptedReference`를 돌려줘야 하는 검증 GET, 수신자/제목/본문에 대한 안정 digest, 단일 claim attempt로 제안됩니다. `main.ts`는 `OI_HTTP_MESSAGE_BINDINGS`에 email 템플릿을 전혀 추가하지 않습니다. 따라서 발송을 인가하는 템플릿이 툴이 만드는 요청과 어긋날 수 없습니다. 인가는 일반 host message binding이 아니라 기능 자신이 수행합니다. `agentEmailPlanAuthorizer`는 신원과 후보 요청의 draft 필드로 기대 plan을 다시 만들어 URL, method, body, 자격 증명 reference를 포함한 header, 검증 URL과 expectation까지 바이트 단위로 같을 때만 인가합니다. recipient/topic/message 경로로는 인증된 발신자를 표현할 수 없기 때문입니다. 둘 다 없으면 일반 `assistant_managed_http` 요청이 기존 owner send 규칙 아래에서 `from`만 바꿔 agent-email 인가를 얻을 수 있습니다. 바이트 동일성 덕분에 중복 멤버, escape된 키 표기, 공백 변형은 모두 "이 plan이 아님"이 되어 인가가 파싱 방식에 의존하지 않습니다. 검증은 상관관계와 성공을 한 필드로 함께 확인합니다. managed plan은 expectation을 하나만 담을 수 있으므로, provider는 실제로 접수한 메시지에 대해서만, 그리고 질의된 reference에 대해서만 `acceptedReference`를 돌려줍니다. reference는 소유 work에 묶이며, payload를 그대로 복사하는 반복은 첫 효과의 상태로 확정될 수 있으므로 상관관계 기능 액션에는 반복 정책을 허용하지 않습니다. 자격 증명 binding과 정확한 origin/header 사용, 비어 있지 않은 값, 평문 origin은 `OI_HTTP_LOCAL_ORIGINS`에 등록되고 동시에 literal loopback/RFC1918/ULA 주소여야 한다는 점(`localhost`를 포함한 DNS 이름은 dispatch가 요청 시점 해석 주소로 판단하므로 거부)은 모두 시작 시 검증되므로, 승인된 발송이 dispatch에서만 실패하는 상태로 기능이 등록될 수 없습니다. 클래스가 `external_message`이므로 정확한 `/allow-send` 규칙이 일상적인 메일을 인가할 수 있고, 그 밖에는 해당 ID/revision/digest를 지목한 `/approve`를 기다립니다.
+
+받은 메일은 권한이 아니라 증거입니다. `ingestAgentEmail()`은 provider 메시지 ID마다 관측 하나를 멱등하게 admit하며 `provenance.principal = "third_party"`, `channel = "email"`, 본문은 경계가 있는 크기로 저장하고, 보낸 주소가 에이전트 자신이면 거부합니다. 자기 자신에게 보낸 루프가 작업을 만들어낼 수 없습니다.
+
+### 신뢰할 수 있는 상대와의 협조
+
+소유자의 에이전트는 기존 iMessage 전송 경로로 다른 사람의 에이전트와 협조할 수 있으며, 대상은 `trusted_peers`의 명시적 허용 목록으로 제한됩니다(`store.listTrustedPeers`, `upsertTrustedPeer`, `revokeTrustedPeer`). 등록과 취소는 사람을 신뢰 경계 안팎으로 옮기는 일이므로 모델 툴이 아니라 인증된 `peers.list` / `peers.upsert` / `peers.revoke` control op로 수행합니다. 핸들은 소유자 게이트와 동일한 `imessage/allowlist.ts` 정규화를 사용하므로 신뢰 판정과 조회가 서로 다른 핸들을 볼 수 없습니다. 신뢰는 제안 시점만이 아니라 전송 경계에서 다시 평가하므로, 상대를 취소하면 이미 승인된 envelope도 나가지 않습니다.
+
+전송 형식은 한 줄짜리 `OI-PEER/1` JSON envelope(`daemon/src/peers/envelope.ts`)이며 `v`, `kind`, `threadKey`, `subject`, `body`, 32자 hex `nonce`만 허용합니다. 보낸 쪽은 신뢰할 수 없는 입력이므로 `decodePeerEnvelope`는 알 수 없는 키, 잘못된 버전, 제어 문자, 초과 길이, 잘못된 nonce에 대해 예외가 아니라 `undefined`를 돌려줍니다.
+
+`main.ts`의 `handleOwnerMessages`는 소유자가 아닌 메시지를 절대 소유자 턴으로 승격하지 않습니다. 비소유자 행은 `admitInboundPeerMessage`로 가고, `trusted` 상태인 상대의 handle+nonce 조합마다 `third_party` 관측 하나만 admit하며 나머지(`not_an_envelope`, `untrusted_peer`, `revoked_peer`)는 무시합니다. 취소된 상대는 과거 행이 남아 있어도 무시됩니다. 보내는 envelope은 해당 handle과 thread key에 묶인 `external_message` 액션이며, 전송 전에 claim하고 전달 receipt와 함께 `confirmed`로, 효과가 이미 발생했을 수 있는 전송 실패는 `ambiguous`로 정산합니다. peer envelope에는 반복 정책을 허용하지 않습니다. nonce가 일회용이고 관리형 dispatcher에 peer 반복 executor가 없어, 정책을 받아들여도 만기 시 취소밖에 될 수 없기 때문입니다.
+
+### 외부 통화
+
+`configuredCallProvider()`(`daemon/src/calls/provider.ts`)는 통신 provider의 origin, 생성/상태 path, 발신자 번호, `secretRef`를 읽고 수신 번호는 엄격한 E.164로 정규화합니다. 통화는 되돌릴 수 없고 비용이 발생하므로 `proposeAgentCall()`은 이를 `external_mutation`으로 분류합니다. `ownerRuleCanAuthorize()`가 구조적으로 이를 거부하므로 모든 통화는 해당 identity를 지목한 인증된 `/approve`를 요구하며 어떤 send 규칙도 대신할 수 없습니다. 제안에는 수신자, 목적, 에이전트가 말해도 되는 스크립트, 1~30분 상한이 승인 화면에서 읽히도록 scope와 cost로 담깁니다. 실행은 POST 한 번과 provider 상태 검증이며, 그 검증은 provider가 실제로 발신한 통화에 대해서만 `placedReference`로 돌려주는 통화별 `clientReference`에 묶입니다. `placed`만 보고하는 상태 endpoint라면 이전이나 동시 통화가 과금되는 이 통화를 확정해 버릴 수 있기 때문입니다. 5xx는 두 번째 POST 없이 `definitive_failed`, 응답 없음이나 상관관계가 없는 상태는 `ambiguous`로 `uncertain`으로 보고되고 자동 재시도하지 않으며, 취소된 툴 호출은 POST에 도달하지 않습니다.
 
 ### 적응형 소유자 알림
 

@@ -10,6 +10,7 @@ import { readRuntimeConfig } from "../../daemon/src/runtime-config.ts";
 import { openStateStore, type DeliveryRecord } from "../../daemon/src/store/index.ts";
 import { requestControl, type ControlPayload } from "../lib/control-client.ts";
 import { hasCadenceReport, isPromptHash } from "./conversational-child-checks.ts";
+import { selectPanelToggleMonitor } from "./panel-supervision-checks.ts";
 
 /**
  * REAL acceptance harness for the spec's AC-1..AC-11. Every scenario exercises
@@ -426,27 +427,30 @@ async function scenarioPanelSupervision(): Promise<ScenarioResult> {
     `status bootstrap=${String(recordAt(status.payload, "bootstrap").state)} activeChildren=${activeChildren.length}`,
     `monitors.list count=${monitorRows.length}`,
   ];
-  // Exercise the revision-fenced toggle round-trip when a monitor exists.
-  const candidate = monitorRows.find((entry) => isRecord(entry) && typeof entry.enabled === "boolean" && Number.isSafeInteger(entry.revision));
-  if (isRecord(candidate)) {
-    const toggled = await requestControl(options.socket, "monitors.toggle", {
-      id: candidate.id as string,
-      enabled: !(candidate.enabled as boolean),
-      expectedRevision: candidate.revision as number,
-    });
-    const changed = recordAt(toggled.payload, "monitor");
-    const restored = await requestControl(options.socket, "monitors.toggle", {
-      id: candidate.id as string,
-      enabled: candidate.enabled as boolean,
-      expectedRevision: changed.revision as number,
-    });
-    if (recordAt(restored.payload, "monitor").enabled !== candidate.enabled) {
-      return fail(`monitor ${String(candidate.id)} could not be restored after the toggle round-trip`);
-    }
-    evidence.push(`monitor ${String(candidate.id)} toggle round-trip with revision fencing OK`);
-  } else {
-    evidence.push("no monitor available for a toggle round-trip (toggle verb capability verified via monitors.list only)");
+  const selection = selectPanelToggleMonitor(monitorRows, process.env.OI_ACCEPTANCE_MONITOR_ID);
+  if (selection.outcome !== "READY") {
+    return { outcome: selection.outcome, evidence: [...evidence, selection.reason] };
   }
+  const candidate = selection.monitor;
+  const toggled = await requestControl(options.socket, "monitors.toggle", {
+    id: candidate.id,
+    enabled: !candidate.enabled,
+    expectedRevision: candidate.revision,
+  });
+  const changed = recordAt(toggled.payload, "monitor");
+  const restored = await requestControl(options.socket, "monitors.toggle", {
+    id: candidate.id,
+    enabled: candidate.enabled,
+    expectedRevision: changed.revision as number,
+  });
+  if (recordAt(restored.payload, "monitor").enabled !== candidate.enabled) {
+    return fail(...evidence, `monitor ${candidate.id} could not be restored after the toggle round-trip`);
+  }
+  if (changed.enabled !== !candidate.enabled || changed.id !== candidate.id ||
+      recordAt(restored.payload, "monitor").id !== candidate.id) {
+    return fail(...evidence, `monitor ${candidate.id} toggle round-trip returned unexpected monitor state`);
+  }
+  evidence.push(`operator-selected monitor ${candidate.id} toggle round-trip with revision fencing OK`);
   return pass(...evidence);
 }
 

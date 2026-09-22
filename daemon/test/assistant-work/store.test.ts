@@ -5,7 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  ACTION_STATES,
   authorizationRequirementForEffect,
+  isActionState,
   stableAttemptId,
   stableObservationId,
   stableRecontactId,
@@ -15,6 +17,7 @@ import type {
   EvidenceProvenance,
   ProposeActionInput,
 } from "../../src/assistant-work/model.ts";
+import { hasMaterialIntegrityViolation } from "../../src/store/assistant-work.ts";
 import { openStateStore, SchemaVersionError } from "../../src/store/db.ts";
 import { MIGRATIONS } from "../../src/store/migrations.ts";
 
@@ -122,7 +125,7 @@ describe("assistant-work durable identity", () => {
 
     const upgraded = openStateStore(path);
     try {
-      expect(upgraded.migrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+      expect(upgraded.migrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
       expect(upgraded.getChild("v8-child")).toMatchObject({
         state: "idle",
         origin: "owner",
@@ -146,7 +149,7 @@ describe("assistant-work durable identity", () => {
 
     const validated = openStateStore(path);
     try {
-      expect(validated.migrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+      expect(validated.migrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
       expect(validated.getChild("v8-child")).toMatchObject({ state: "idle" });
       expect(validated.assistantWork.listWorks()).toHaveLength(1);
     } finally {
@@ -232,7 +235,7 @@ describe("assistant-work durable identity", () => {
       const first = store.assistantWork.admitObservation(input, T0);
       const replay = store.assistantWork.admitObservation(input, T1);
 
-      expect(store.migrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+      expect(store.migrationVersions()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
       expect(first.created).toBe(true);
       expect(replay.created).toBe(false);
       expect(first.work.id).toBe(stableWorkId(input.workKey));
@@ -832,6 +835,348 @@ describe("assistant-work crash boundaries", () => {
       }, T3)).toThrow("external effect must not be invoked or repeated");
     } finally {
       reopened.close();
+    }
+  });
+});
+
+describe("assistant-work action state vocabulary", () => {
+  test("every persisted state the schema admits decodes, and a foreign state does not", () => {
+    const root = mkdtempSync(join(tmpdir(), "oi-action-states-"));
+    try {
+      const store = openStateStore(join(root, "state.db"));
+      try {
+        // The schema CHECK list and the decoder's vocabulary must agree exactly;
+        // a drift either rejects legitimate rows or silently trusts foreign ones.
+        const db = new Database(join(root, "state.db"), { readonly: true });
+        try {
+          const sql = String((db.query("SELECT sql FROM sqlite_master WHERE name = 'assistant_work_actions'").get() as { readonly sql: string }).sql);
+          for (const state of ACTION_STATES) {
+            expect(sql).toContain(`'${state}'`);
+            expect(isActionState(state)).toBe(true);
+          }
+        } finally {
+          db.close();
+        }
+        for (const foreign of ["", "retired_authorized", "APPROVAL_PENDING", "approval pending", "planned "]) {
+          expect(isActionState(foreign)).toBe(false);
+        }
+      } finally {
+        store.close();
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("assistant-work material binding at claim", () => {
+  test("a post-approval material rewrite cannot be dispatched under the original digest", () => {
+    const root = mkdtempSync(join(tmpdir(), "oi-material-binding-"));
+    try {
+      const path = join(root, "state.db");
+      const store = openStateStore(path);
+      const at = "2026-01-01T00:00:00.000Z";
+      const work = store.assistantWork.admitObservation({
+        source: "fixture", occurrenceKey: "bind", workKey: "bind", workTitle: "bind", observedAt: at,
+        evidence: {}, provenance: { principal: "system", channel: "fixture", subject: "bind", evidenceId: "bind" },
+      }, at).work;
+      const action = store.assistantWork.proposeAction({
+        workId: work.id, semanticKey: "bind", effectClass: "external_mutation",
+        recipient: "+15550000001", topic: "call", action: "managed_http_request",
+        payload: { body: JSON.stringify({ to: "+15550000001" }) },
+      }, at);
+      store.assistantWork.grantExplicitApproval({
+        actionId: action.id, revision: action.revision, digest: action.digest,
+        provenance: { principal: "owner", channel: "fixture", subject: "owner", evidenceId: "bind" },
+      }, at);
+      store.close();
+
+      // Rewrite the persisted material while keeping the approved digest, the
+      // way a tampered row would. The claim must refuse it rather than let any
+      // executor dispatch material the owner never approved.
+      const db = new Database(path);
+      try {
+        db.query("UPDATE assistant_work_action_revisions SET payload_json = ? WHERE action_id = ?")
+          .run(JSON.stringify({ body: JSON.stringify({ to: "+15559999999" }) }), action.id);
+      } finally {
+        db.close();
+      }
+
+      const reopened = openStateStore(path);
+      try {
+        const claim = reopened.assistantWork.claimForDispatch({
+          actionId: action.id, revision: action.revision, digest: action.digest,
+          attemptId: "tampered-attempt", workerId: "fixture",
+        }, at);
+        expect(claim).toMatchObject({ kind: "rejected", reason: "stale_digest" });
+        expect(reopened.assistantWork.listAttempts(action.id)).toHaveLength(0);
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a resumed claim reports stale_digest when the stored material was rewritten", () => {
+    const root = mkdtempSync(join(tmpdir(), "oi-resume-signal-"));
+    try {
+      const path = join(root, "state.db");
+      const store = openStateStore(path);
+      const at = "2026-01-01T00:00:00.000Z";
+      const work = store.assistantWork.admitObservation({
+        source: "fixture", occurrenceKey: "resume", workKey: "resume", workTitle: "resume", observedAt: at,
+        evidence: {}, provenance: { principal: "system", channel: "fixture", subject: "resume", evidenceId: "resume" },
+      }, at).work;
+      const action = store.assistantWork.proposeAction({
+        workId: work.id, semanticKey: "resume", effectClass: "external_mutation",
+        recipient: "someone", topic: "topic", action: "managed_http_request",
+        payload: { body: JSON.stringify({ status: "safe" }) },
+      }, at);
+      store.assistantWork.grantExplicitApproval({
+        actionId: action.id, revision: action.revision, digest: action.digest,
+        provenance: { principal: "owner", channel: "fixture", subject: "owner", evidenceId: "resume" },
+      }, at);
+      const attemptId = "resume-attempt";
+      store.assistantWork.claimForDispatch({
+        actionId: action.id, revision: action.revision, digest: action.digest, attemptId, workerId: "w",
+      }, at);
+      store.close();
+
+      const db = new Database(path);
+      try {
+        db.query("UPDATE assistant_work_action_revisions SET payload_json = ? WHERE action_id = ?")
+          .run(JSON.stringify({ body: JSON.stringify({ status: "pwned" }) }), action.id);
+      } finally {
+        db.close();
+      }
+
+      const reopened = openStateStore(path);
+      try {
+        // `already_claimed` would point the operator at the attempt instead of
+        // the rewritten action, so the signal must name the real cause.
+        expect(reopened.assistantWork.claimForDispatch({
+          actionId: action.id, revision: action.revision, digest: action.digest, attemptId, workerId: "w",
+        }, at)).toMatchObject({ kind: "rejected", reason: "stale_digest" });
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a rewritten source action cannot be re-legitimized through a repeat policy", () => {
+    const root = mkdtempSync(join(tmpdir(), "oi-followup-binding-"));
+    try {
+      const path = join(root, "state.db");
+      const store = openStateStore(path);
+      const at = "2026-01-01T00:00:00.000Z";
+      const work = store.assistantWork.admitObservation({
+        source: "fixture", occurrenceKey: "rep", workKey: "rep", workTitle: "rep", observedAt: at,
+        evidence: {}, provenance: { principal: "system", channel: "fixture", subject: "rep", evidenceId: "rep" },
+      }, at).work;
+      const action = store.assistantWork.proposeAction({
+        workId: work.id, semanticKey: "rep", effectClass: "external_message",
+        recipient: "+15550000001", topic: "note", action: "managed_http_request",
+        payload: { body: JSON.stringify({ text: "original" }) },
+      }, at);
+      store.assistantWork.grantExplicitApproval({
+        actionId: action.id, revision: action.revision, digest: action.digest,
+        provenance: { principal: "owner", channel: "fixture", subject: "owner", evidenceId: "rep" },
+      }, at);
+      // The source must be CONFIRMED for a repeat to materialize at all.
+      const attemptId = "rep-attempt";
+      store.assistantWork.claimForDispatch({
+        actionId: action.id, revision: action.revision, digest: action.digest,
+        attemptId, workerId: "fixture",
+      }, at);
+      store.assistantWork.markEffectStarted({ attemptId, workerId: "fixture" }, at);
+      store.assistantWork.confirmAttempt({ attemptId, workerId: "fixture", outcome: { ok: true } }, at);
+      expect(store.assistantWork.getAction(action.id)?.state).toBe("confirmed");
+      store.assistantWork.setFollowupPolicy({
+        workId: work.id, actionId: action.id, enabled: true, intervalMs: 1,
+        maxAttempts: 3,
+        provenance: { principal: "owner", channel: "fixture", subject: "owner", evidenceId: "rep" },
+      }, at);
+      store.close();
+
+      // A repeat re-hashes the source material into a new action, so a
+      // rewritten source must not be carried forward under a fresh digest.
+      const db = new Database(path);
+      try {
+        db.query("UPDATE assistant_work_action_revisions SET payload_json = ? WHERE action_id = ?")
+          .run(JSON.stringify({ body: JSON.stringify({ text: "rewritten" }) }), action.id);
+      } finally {
+        db.close();
+      }
+
+      const reopened = openStateStore(path);
+      try {
+        const due = reopened.assistantWork.claimDueFollowup(work.id, "fixture-worker", "2026-01-01T01:00:00.000Z");
+        expect(due).toMatchObject({ kind: "none" });
+        expect(reopened.assistantWork.listActions(work.id)).toHaveLength(1);
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a settlement recorded against rewritten material is marked and refused as authority", () => {
+    const root = mkdtempSync(join(tmpdir(), "oi-marker-"));
+    try {
+      const path = join(root, "state.db");
+      const store = openStateStore(path);
+      const at = "2026-01-01T00:00:00.000Z";
+      const work = store.assistantWork.admitObservation({
+        source: "fixture", occurrenceKey: "marker", workKey: "marker", workTitle: "marker", observedAt: at,
+        evidence: {}, provenance: { principal: "system", channel: "fixture", subject: "marker", evidenceId: "marker" },
+      }, at).work;
+      const action = store.assistantWork.proposeAction({
+        workId: work.id, semanticKey: "marker", effectClass: "external_mutation",
+        recipient: "+15550000001", topic: "call", action: "managed_http_request",
+        payload: { body: JSON.stringify({ to: "+15550000001" }) },
+      }, at);
+      store.assistantWork.grantExplicitApproval({
+        actionId: action.id, revision: action.revision, digest: action.digest,
+        provenance: { principal: "owner", channel: "fixture", subject: "owner", evidenceId: "marker" },
+      }, at);
+      const attemptId = "marker-attempt";
+      store.assistantWork.claimForDispatch({
+        actionId: action.id, revision: action.revision, digest: action.digest, attemptId, workerId: "w",
+      }, at);
+      store.assistantWork.markEffectStarted({ attemptId, workerId: "w" }, at);
+      store.close();
+
+      // Rewrite the material after the effect started: the outcome is still a
+      // fact about what happened, so it is recorded — but marked, because it no
+      // longer describes material the owner approved.
+      const db = new Database(path);
+      try {
+        db.query("UPDATE assistant_work_action_revisions SET payload_json = ? WHERE action_id = ?")
+          .run(JSON.stringify({ body: JSON.stringify({ to: "+15559999999" }) }), action.id);
+      } finally {
+        db.close();
+      }
+
+      const reopened = openStateStore(path);
+      try {
+        const settled = reopened.assistantWork.confirmAttempt({ attemptId, workerId: "w", outcome: { ok: true } }, at);
+        expect(settled.attempt.state).toBe("confirmed");
+        expect(settled.attempt.outcome).toMatchObject({ materialIntegrityViolation: true });
+        expect(hasMaterialIntegrityViolation(settled.attempt.outcome)).toBe(true);
+        // A flagged confirmation is never authority to complete work.
+        expect(hasMaterialIntegrityViolation({ ok: true })).toBe(false);
+        expect(hasMaterialIntegrityViolation(undefined)).toBe(false);
+
+        // Resolving an ambiguity is a decision, not a record, so it refuses.
+        const other = reopened.assistantWork.proposeAction({
+          workId: work.id, semanticKey: "marker-2", effectClass: "external_mutation",
+          recipient: "+15550000002", topic: "call", action: "managed_http_request",
+          payload: { body: JSON.stringify({ to: "+15550000002" }) },
+        }, at);
+        reopened.assistantWork.grantExplicitApproval({
+          actionId: other.id, revision: other.revision, digest: other.digest,
+          provenance: { principal: "owner", channel: "fixture", subject: "owner", evidenceId: "marker-2" },
+        }, at);
+        const otherAttempt = "marker-other-attempt";
+        reopened.assistantWork.claimForDispatch({
+          actionId: other.id, revision: other.revision, digest: other.digest, attemptId: otherAttempt, workerId: "w",
+        }, at);
+        reopened.assistantWork.markEffectStarted({ attemptId: otherAttempt, workerId: "w" }, at);
+        reopened.assistantWork.markAttemptAmbiguous({ attemptId: otherAttempt, workerId: "w", outcome: { reason: "timeout" } }, at);
+
+        const db2 = new Database(path);
+        try {
+          db2.query("UPDATE assistant_work_action_revisions SET payload_json = ? WHERE action_id = ?")
+            .run(JSON.stringify({ body: JSON.stringify({ to: "+15558888888" }) }), other.id);
+        } finally {
+          db2.close();
+        }
+
+        const final = openStateStore(path);
+        try {
+          expect(() => final.assistantWork.resolveAmbiguousAttempt({
+            attemptId: otherAttempt, workerId: "w", resolution: "confirmed",
+            evidenceSource: "fixture", evidenceId: "marker-resolution", evidence: { resolved: true },
+          }, at)).toThrow(/no longer matches its approved digest/);
+        } finally {
+          final.close();
+        }
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a repeat is refused when the source confirmation was recorded against rewritten material", () => {
+    const root = mkdtempSync(join(tmpdir(), "oi-repeat-flagged-"));
+    try {
+      const path = join(root, "state.db");
+      const store = openStateStore(path);
+      const at = "2026-01-01T00:00:00.000Z";
+      const work = store.assistantWork.admitObservation({
+        source: "fixture", occurrenceKey: "repflag", workKey: "repflag", workTitle: "repflag", observedAt: at,
+        evidence: {}, provenance: { principal: "system", channel: "fixture", subject: "repflag", evidenceId: "repflag" },
+      }, at).work;
+      const action = store.assistantWork.proposeAction({
+        workId: work.id, semanticKey: "repflag", effectClass: "external_message",
+        recipient: "someone", topic: "note", action: "managed_http_request",
+        payload: { body: JSON.stringify({ text: "original" }) },
+      }, at);
+      store.assistantWork.grantExplicitApproval({
+        actionId: action.id, revision: action.revision, digest: action.digest,
+        provenance: { principal: "owner", channel: "fixture", subject: "owner", evidenceId: "repflag" },
+      }, at);
+      const attemptId = "repflag-attempt";
+      store.assistantWork.claimForDispatch({
+        actionId: action.id, revision: action.revision, digest: action.digest, attemptId, workerId: "w",
+      }, at);
+      store.assistantWork.markEffectStarted({ attemptId, workerId: "w" }, at);
+      store.assistantWork.setFollowupPolicy({
+        workId: work.id, actionId: action.id, enabled: true, intervalMs: 1, maxAttempts: 3,
+        provenance: { principal: "owner", channel: "fixture", subject: "owner", evidenceId: "repflag" },
+      }, at);
+      store.close();
+
+      // Rewrite the material, settle against it (recording a flagged
+      // confirmation), then restore the approved payload.
+      const db = new Database(path);
+      const approved = (db.query("SELECT payload_json FROM assistant_work_action_revisions WHERE action_id = ?")
+        .get(action.id) as { readonly payload_json: string }).payload_json;
+      db.query("UPDATE assistant_work_action_revisions SET payload_json = ? WHERE action_id = ?")
+        .run(JSON.stringify({ body: JSON.stringify({ text: "rewritten" }) }), action.id);
+      db.close();
+
+      const mid = openStateStore(path);
+      const settled = mid.assistantWork.confirmAttempt({ attemptId, workerId: "w", outcome: { ok: true } }, at);
+      expect(hasMaterialIntegrityViolation(settled.attempt.outcome)).toBe(true);
+      mid.close();
+
+      const restore = new Database(path);
+      try {
+        restore.query("UPDATE assistant_work_action_revisions SET payload_json = ? WHERE action_id = ?").run(approved, action.id);
+      } finally {
+        restore.close();
+      }
+
+      const reopened = openStateStore(path);
+      try {
+        // Restoring the payload does not un-ring the bell: the source's only
+        // confirmation was recorded against rewritten material, so a repeat
+        // copying it would inherit an unusable receipt.
+        expect(reopened.assistantWork.claimDueFollowup(work.id, "fixture-worker", "2026-01-01T01:00:00.000Z"))
+          .toMatchObject({ kind: "none", reason: "source_unconfirmed" });
+        expect(reopened.assistantWork.listActions(work.id)).toHaveLength(1);
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });

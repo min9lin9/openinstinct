@@ -52,6 +52,9 @@ struct MenuBarView: View {
                     MonitorsView(model: model)
                 }
 
+                // Recovery must remain reachable even while setup is shown.
+                RecoveryView(model: model)
+
                 HStack {
                     Spacer()
                     Button("Quick actions…") {
@@ -165,7 +168,7 @@ enum Health {
         case .asleep: return "Paused"
         case .awake: return "Awake and listening"
         case .trouble: return "Something's off"
-        case .offline: return "Not running"
+        case .offline: return "Not responding"
         }
     }
 
@@ -179,7 +182,7 @@ enum Health {
             return imessage
                 ? "Text Gajae on iMessage or open Chat."
                 : "Open Chat to talk to Gajae. Add your number under Settings → iMessage to text it too."
-        case .offline(let why): return why ?? "Gajae isn't running on this Mac right now. Reinstall it, or wait a moment and check again."
+        case .offline(let why): return why ?? "The panel cannot reach Gajae right now. It may still be running. Refresh again or use Recovery below."
         }
     }
 
@@ -374,7 +377,6 @@ struct StatusView: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
-            RecoveryView(model: model)
         }
     }
 }
@@ -402,12 +404,24 @@ private struct RecoveryView: View {
                     showingForceConfirmation = true
                 }
                 .controlSize(.small)
-                .disabled(model.recoveryInProgress)
             }
             if model.recoveryInProgress {
                 ProgressView("Working…")
                     .controlSize(.small)
                     .font(.caption)
+            }
+            if let notice = model.notice {
+                HStack {
+                    Image(systemName: "info.circle")
+                    Text(notice)
+                        .font(.caption)
+                    Spacer()
+                    Button("OK") {
+                        model.clearNotice()
+                    }
+                    .font(.caption)
+                }
+                .foregroundStyle(.orange)
             }
         }
         .padding(8)
@@ -444,20 +458,6 @@ struct MonitorsView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-            }
-
-            if let notice = model.notice {
-                HStack {
-                    Image(systemName: "info.circle")
-                    Text(notice)
-                        .font(.caption)
-                    Spacer()
-                    Button("OK") {
-                        model.clearNotice()
-                    }
-                    .font(.caption)
-                }
-                .foregroundStyle(.orange)
             }
 
             if model.connectionState == .connected && model.monitors.isEmpty {

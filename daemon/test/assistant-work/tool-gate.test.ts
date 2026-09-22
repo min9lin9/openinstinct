@@ -312,3 +312,13 @@ describe("managed tool host classification", () => {
     expect(classifyManagedToolCall("write", { path: "/tmp/x" })).toMatchObject({ kind: "redirect_local_file" });
   });
 });
+
+test("capability tools carry their own ledger gate and are not treated as opaque mutations", () => {
+  // These three propose and execute through the assistant-work ledger in every
+  // mutating mode. Classifying them opaquely here would block their read-only
+  // modes and demand a second unrelated approval for an approved effect.
+  for (const toolName of ["agent_email", "agent_call", "peer_coordinate"]) {
+    expect(classifyManagedToolCall(toolName, {})).toEqual({ kind: "allow" });
+  }
+  expect(classifyManagedToolCall("bash", { command: "ls" })).toMatchObject({ kind: "opaque_external_mutation" });
+});

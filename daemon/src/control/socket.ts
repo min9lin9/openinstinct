@@ -10,6 +10,7 @@ import { nextCronRun } from "../monitors/scheduler.ts";
 import { PROTECTED_MONITOR_IDS, MonitorBusyError, MonitorNotFoundError, MonitorProtectedError, MonitorRevisionConflictError } from "../monitors/types.ts";
 import type { MonitorSpec } from "../monitors/types.ts";
 import type { StateStore } from "../store/index.ts";
+import type { TrustedPeerRecord, TrustedPeerRelation } from "../peers/trusted.ts";
 import { SessionCompaction, type CompactRunner, type CompactStatus } from "./compaction.ts";
 import { isDaemonPaused, setDaemonPaused } from "./pause.ts";
 
@@ -338,6 +339,49 @@ export class ControlServer {
               request.id,
             )),
           );
+        return;
+      }
+      case "peers.list": {
+        this.send(socket, {
+          type: "response",
+          id: request.id,
+          ok: true,
+          payload: { peers: this.options.store.listTrustedPeers().map(trustedPeerPayload) },
+        });
+        return;
+      }
+      // Adding or revoking a trusted person moves the trust boundary, so it is
+      // an authenticated operator action on this socket, never a model tool.
+      case "peers.upsert": {
+        const payload = request.payload as { readonly handle: string; readonly displayName: string; readonly relation: TrustedPeerRelation };
+        try {
+          const peer: TrustedPeerRecord = this.options.store.upsertTrustedPeer({
+            handle: payload.handle,
+            displayName: payload.displayName,
+            relation: payload.relation,
+          }, new Date().toISOString());
+          this.send(socket, { type: "response", id: request.id, ok: true, payload: { peer: trustedPeerPayload(peer) } });
+        } catch (error) {
+          this.send(socket, errorFrame(
+            "internal_error",
+            error instanceof Error ? error.message : "trusted peer upsert failed",
+            request.id,
+          ));
+        }
+        return;
+      }
+      case "peers.revoke": {
+        const payload = request.payload as { readonly handle: string };
+        try {
+          const peer = this.options.store.revokeTrustedPeer(payload.handle, new Date().toISOString());
+          this.send(socket, { type: "response", id: request.id, ok: true, payload: { peer: trustedPeerPayload(peer) } });
+        } catch (error) {
+          this.send(socket, errorFrame(
+            "internal_error",
+            error instanceof Error ? error.message : "trusted peer revocation failed",
+            request.id,
+          ));
+        }
         return;
       }
       case "assistant.notifications.list": {
@@ -1190,4 +1234,17 @@ function triggerPayload(monitor: MonitorSpec): JsonObject {
     case "script":
       return { kind: "script", argv: [...monitor.trigger.argv], intervalMs: monitor.trigger.intervalMs };
   }
+}
+
+/** Trusted-peer rows cross the socket as plain JSON, never as store records. */
+function trustedPeerPayload(peer: TrustedPeerRecord): JsonObject {
+  return {
+    id: peer.id,
+    handle: peer.handle,
+    displayName: peer.displayName,
+    relation: peer.relation,
+    state: peer.state,
+    createdAt: peer.createdAt,
+    updatedAt: peer.updatedAt,
+  };
 }

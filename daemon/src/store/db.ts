@@ -6,6 +6,7 @@ import { dirname } from "node:path";
 
 import { LATEST_SCHEMA_VERSION, MIGRATIONS } from "./migrations.ts";
 import { createAssistantWorkRepository, type AssistantWorkRepository } from "./assistant-work.ts";
+import { normalizeHandle, trustedPeerId, type TrustedPeerRecord, type TrustedPeerRelation, type TrustedPeerState, type TrustedPeerUpsertInput } from "../peers/trusted.ts";
 
 export class SchemaVersionError extends Error {
   public constructor(version: number) {
@@ -46,6 +47,16 @@ interface ForeignKeyCheckRow {
 }
 interface MetaRow {
   readonly value: string;
+}
+
+interface TrustedPeerRow {
+  readonly id: string;
+  readonly handle: string;
+  readonly display_name: string;
+  readonly relation: TrustedPeerRelation;
+  readonly state: TrustedPeerState;
+  readonly created_at: string;
+  readonly updated_at: string;
 }
 
 export type DeliveryState = "pending" | "inflight" | "confirmed" | "failed_ambiguous" | "expired";
@@ -478,6 +489,10 @@ interface DeliveryRow {
   readonly last_error_message: string | null;
 }
 
+const TRUSTED_PEER_COLUMNS = `
+  id, handle, display_name, relation, state, created_at, updated_at
+`;
+
 const DELIVERY_COLUMNS = `
   id, child_id, state, idempotency_key, attempts, next_attempt_at, created_at, updated_at,
   delivery_kind, handle, body, file_path, reply_to_guid, quoted_text, degraded, redelivered,
@@ -564,6 +579,69 @@ export class StateStore {
     return (this.db.query(
       "SELECT key, value FROM meta WHERE key LIKE ? ESCAPE '\\' ORDER BY key",
     ).all(`${escaped}%`) as Array<{ readonly key: string; readonly value: string }>);
+  }
+
+  public upsertTrustedPeer(input: TrustedPeerUpsertInput, now: string): TrustedPeerRecord {
+    assertTrustedPeerInput(input);
+    assertTimestamp(now, "trusted peer upsert now");
+    const handle = normalizeHandle(input.handle);
+    if (handle === undefined) {
+      throw new Error("trusted peer handle is invalid");
+    }
+    const id = trustedPeerId(handle);
+    const state = input.state ?? "trusted";
+    this.db.query(
+      `INSERT INTO trusted_peers (id, handle, display_name, relation, state, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(handle) DO UPDATE SET
+         display_name = excluded.display_name,
+         relation = excluded.relation,
+         state = excluded.state,
+         updated_at = excluded.updated_at`,
+    ).run(id, handle, input.displayName, input.relation, state, now, now);
+    const peer = this.getTrustedPeer(id);
+    if (peer === undefined) {
+      throw new Error(`trusted peer upsert was not persisted: ${id}`);
+    }
+    return peer;
+  }
+
+  public getTrustedPeer(idOrHandle: string): TrustedPeerRecord | undefined {
+    if (typeof idOrHandle !== "string" || idOrHandle.trim().length === 0) {
+      throw new Error("trusted peer id or handle must be non-empty");
+    }
+    const normalized = normalizeHandle(idOrHandle);
+    const row = normalized === undefined
+      ? this.db.query(`SELECT ${TRUSTED_PEER_COLUMNS} FROM trusted_peers WHERE id = ?`).get(idOrHandle) as TrustedPeerRow | null
+      : this.db.query(`SELECT ${TRUSTED_PEER_COLUMNS} FROM trusted_peers WHERE handle = ?`).get(normalized) as TrustedPeerRow | null;
+    return row === null ? undefined : toTrustedPeerRecord(row);
+  }
+
+  public listTrustedPeers(state?: TrustedPeerState): TrustedPeerRecord[] {
+    if (state !== undefined && state !== "trusted" && state !== "revoked") {
+      throw new Error("trusted peer state is invalid");
+    }
+    const clause = state === undefined ? "" : " WHERE state = ?";
+    return (this.db.query(
+      `SELECT ${TRUSTED_PEER_COLUMNS} FROM trusted_peers${clause} ORDER BY created_at, ROWID`,
+    ).all(...(state === undefined ? [] : [state])) as TrustedPeerRow[]).map(toTrustedPeerRecord);
+  }
+
+  public revokeTrustedPeer(idOrHandle: string, now: string): TrustedPeerRecord {
+    assertTimestamp(now, "trusted peer revoke now");
+    const existing = this.getTrustedPeer(idOrHandle);
+    if (existing === undefined) {
+      throw new Error(`unknown trusted peer: ${idOrHandle}`);
+    }
+    this.db.query(
+      `UPDATE trusted_peers SET state = 'revoked', updated_at = ?
+       WHERE id = ? AND state <> 'revoked'`,
+    ).run(now, existing.id);
+    const revoked = this.getTrustedPeer(existing.id);
+    if (revoked === undefined) {
+      throw new Error(`trusted peer disappeared during revoke: ${existing.id}`);
+    }
+    return revoked;
   }
 
   public admitMemoryIntent(input: MemoryIntentInput, now: string): MemoryIntentRecord {
@@ -1737,6 +1815,18 @@ export class StateStore {
   }
 }
 
+function toTrustedPeerRecord(row: TrustedPeerRow): TrustedPeerRecord {
+  return {
+    id: row.id,
+    handle: row.handle,
+    displayName: row.display_name,
+    relation: row.relation,
+    state: row.state,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 function toDeliveryRecord(row: DeliveryRow): DeliveryRecord {
   return {
     id: row.id,
@@ -2061,6 +2151,20 @@ function assertReceiptInput(input: ReceiptInput): void {
 
 function isTerminalChildState(value: ChildState): value is ChildTerminalInput["state"] {
   return value === "completed" || value === "failed" || value === "timeout" || value === "cancelled";
+}
+
+function assertTrustedPeerInput(input: TrustedPeerUpsertInput): void {
+  assertNonEmpty(input.handle, "trusted peer handle");
+  assertNonEmpty(input.displayName, "trusted peer displayName");
+  if (input.displayName.length > 512) {
+    throw new Error("trusted peer displayName is too long");
+  }
+  if (input.relation !== "household" && input.relation !== "colleague" && input.relation !== "professional" && input.relation !== "business") {
+    throw new Error("trusted peer relation is invalid");
+  }
+  if (input.state !== undefined && input.state !== "trusted" && input.state !== "revoked") {
+    throw new Error("trusted peer state is invalid");
+  }
 }
 
 function assertNonEmpty(value: string, label: string): void {

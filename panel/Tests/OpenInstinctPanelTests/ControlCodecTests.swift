@@ -10,6 +10,7 @@ enum ControlCodecChecks {
     static func run() -> [String] {
         var failures: [String] = []
         failures.append(contentsOf: roundTripFailures())
+        failures.append(contentsOf: negotiatedStatusFailures())
         failures.append(contentsOf: statusFixtureFailures())
         failures.append(contentsOf: chatFixtureFailures())
         failures.append(contentsOf: crossDecodeFailures())
@@ -38,6 +39,68 @@ enum ControlCodecChecks {
             }
         } catch {
             failures.append("golden fixture round trip threw: \(error.localizedDescription)")
+        }
+        return failures
+    }
+
+    /// The daemon's complete capability advertisement must not block status refresh.
+    private static func negotiatedStatusFailures() -> [String] {
+        let expectedCapabilities = [
+            "status.get", "monitors.list", "monitors.toggle", "monitors.run", "monitors.delete",
+            "daemon.pause", "daemon.resume", "session.compact", "session.compact.status",
+            "session.reload", "session.reset", "session.notify", "chat.send", "chat.history",
+            "chat.subscribe", "chat.activity", "assistant.notifications.list",
+            "assistant.notifications.ack", "assistant.notifications.rendered", "settings.get",
+            "settings.set", "models.list", "accounts.list", "accounts.login", "accounts.logout",
+            "accounts.login.finish", "accounts.providers", "accounts.discover", "accounts.adopt",
+            "providers.custom", "daemon.restart", "browser.open", "maintenance.run",
+            "memory.backfillCaptures", "peers.list", "peers.upsert", "peers.revoke"
+        ]
+        var failures: [String] = []
+        do {
+            let fixtures = try fixtureURLs()
+            var reader = FrameReader()
+            for name in ["negotiated.json", "status-response.json"] {
+                guard let url = fixtures.first(where: { $0.lastPathComponent == name }) else {
+                    return ["\(name) is missing from test resources"]
+                }
+                let object = try JSONSerialization.jsonObject(with: Data(contentsOf: url))
+                reader.append(try JSONSerialization.data(withJSONObject: object))
+                reader.append(Data([0x0A]))
+            }
+            guard case .negotiated(let negotiated)? = try reader.nextFrame() else {
+                return ["daemon capabilities did not decode as negotiation before status"]
+            }
+            if negotiated.capabilities.map(\.rawValue) != expectedCapabilities {
+                failures.append("negotiated capabilities differ from daemon CONTROL_CAPABILITIES")
+            }
+            guard negotiated.capabilities.contains(.statusGet) else {
+                return failures + ["negotiation does not allow status.get"]
+            }
+            let request = ControlFrame.request(.statusGet(id: "status-1"))
+            if try ControlCodec.decode(ControlCodec.encode(request)) != request {
+                failures.append("status.get request did not round trip after negotiation")
+            }
+            guard case .response(.status(let id, let status))? = try reader.nextFrame() else {
+                return failures + ["status response was blocked after daemon capability negotiation"]
+            }
+            if id != "status-1" || status.bootstrap.state != .running {
+                failures.append("status response after negotiation lost its request ID or running state")
+            }
+            if try reader.nextFrame() != nil || reader.pendingByteCount != 0 {
+                failures.append("negotiation/status stream left unexpected buffered frames")
+            }
+        } catch {
+            failures.append("daemon negotiation/status stream threw: \(error)")
+        }
+        do {
+            let unknown = Data("{\"type\":\"negotiated\",\"v\":1,\"capabilities\":[\"peers.unknown\"]}".utf8)
+            _ = try ControlCodec.decode(unknown)
+            failures.append("negotiation silently accepted an unknown capability")
+        } catch DecodingError.dataCorrupted {
+            // Capability decoding remains closed to the daemon's supported protocol.
+        } catch {
+            failures.append("unknown capability threw an unexpected error: \(error)")
         }
         return failures
     }

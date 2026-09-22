@@ -195,8 +195,8 @@ a prompt or fetched page. `OI_HTTP_LOCAL_ORIGINS` is a JSON array of exact
 `scheme://host[:port]` origins allowed to resolve to private/local addresses.
 `OI_HTTP_SECRET_BINDINGS` maps a tool-visible secret reference to exactly an
 `origin`, `header`, and environment-variable name, for example
-`{"mailApi":{"origin":"https://api.example","header":"Authorization","environment":"MAIL_API_TOKEN"}}`.
-The model supplies only a reference such as `mailApi`; it cannot send a plaintext
+`{"secret://mail-api":{"origin":"https://api.example","header":"Authorization","environment":"MAIL_API_TOKEN"}}`.
+The model supplies only a reference such as `secret://mail-api`; it cannot send a plaintext
 token in a sensitive header, URL query, or body. A binding is used only for its
 exact origin and header. Public plaintext HTTP cannot carry it, redirects are
 not followed, and a mutation is not called

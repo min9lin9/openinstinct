@@ -14,11 +14,13 @@
     "session.reload",
     "session.reset",
     "session.notify",
-    "maintenance.run",
-    "memory.backfillCaptures",
     "chat.send",
     "chat.history",
     "chat.subscribe",
+    "chat.activity",
+    "assistant.notifications.list",
+    "assistant.notifications.ack",
+    "assistant.notifications.rendered",
     "settings.get",
     "settings.set",
     "models.list",
@@ -31,6 +33,11 @@
     "accounts.adopt",
     "providers.custom",
     "daemon.restart",
-    "browser.open"
+    "browser.open",
+    "maintenance.run",
+    "memory.backfillCaptures",
+    "peers.list",
+    "peers.upsert",
+    "peers.revoke"
   ]
 }

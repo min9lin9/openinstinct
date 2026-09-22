@@ -105,6 +105,15 @@ export class DeliveryService {
     return record;
   }
 
+  /**
+   * The attached platform adapter. Effects with their own durable ledger (peer
+   * coordination) settle their own attempt and send through this directly; owner
+   * text keeps going through the delivery outbox.
+   */
+  public get port(): DeliveryPort {
+    return this.options.port;
+  }
+
   public async markRead(handle: string): Promise<void> {
     await this.options.port.markRead?.(handle);
   }

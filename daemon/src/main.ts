@@ -71,6 +71,12 @@ import { createAssistantLocalFileTool, createAssistantObservationTools, createAs
 import { createManagedInstallTool } from "./assistant-work/install.ts";
 import { createManagedHttpTool } from "./assistant-work/http-effects.ts";
 import { configuredHttpAccess } from "./assistant-work/http-policy.ts";
+import { configuredAgentEmail } from "./email/identity.ts";
+import { createAgentEmailTool } from "./email/tool.ts";
+import { configuredCallProvider } from "./calls/provider.ts";
+import { createAgentCallTool } from "./calls/tool.ts";
+import { createPeerCoordinationTool } from "./peers/tool.ts";
+import { admitInboundPeerMessage } from "./peers/coordination.ts";
 import { OwnerOutbox } from "./delivery/outbox.ts";
 import { toPlainText } from "./delivery/plaintext.ts";
 
@@ -214,6 +220,39 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
     return value === undefined ? undefined : value === "true";
   };
 
+  // Capability identities and their credentials are proven before any lane
+  // starts: a half-configured mail or telephony capability must abort boot, not
+  // let the owner approve a send or call that can only fail at dispatch.
+  const agentEmail = configuredAgentEmail();
+  const callProvider = configuredCallProvider();
+  // The agent-email capability authorizes its own plans; deliberately no email
+  // template is added to the generic binding set, so `assistant_managed_http`
+  // can never claim agent-email classification for a request it composed.
+  const httpAccess = configuredHttpAccess();
+  if (agentEmail !== undefined) {
+    httpAccess.assertCapabilityCredential({
+      label: "OI_AGENT_EMAIL_SECRET_REF",
+      secretRef: agentEmail.secretRef,
+      url: `${agentEmail.sendOrigin}${agentEmail.sendPath}`,
+      headerName: "authorization",
+    });
+    // One reference serves both endpoints, so an inbox on a different origin
+    // would be a guaranteed deferred failure rather than a working capability.
+    httpAccess.assertCapabilityCredential({
+      label: "OI_AGENT_EMAIL_INBOX_URL",
+      secretRef: agentEmail.secretRef,
+      url: agentEmail.inboxUrl,
+      headerName: "authorization",
+    });
+  }
+  if (callProvider !== undefined) {
+    httpAccess.assertCapabilityCredential({
+      label: "OI_AGENT_CALL_SECRET_REF",
+      secretRef: callProvider.secretRef,
+      url: `${callProvider.origin}${callProvider.createPath}`,
+      headerName: "authorization",
+    });
+  }
   const chatDbPath = options.chatDbPath ?? join(paths.home, "Library", "Messages", "chat.db");
   const paused = (): boolean => isDaemonPaused(store);
 
@@ -251,8 +290,10 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
   });
   const assistantWorkRuntime = new AssistantWorkRuntime({
     store,
+    httpAccess,
+    ...(agentEmail === undefined ? {} : { agentEmail }),
     isPaused: () => paused() || closing || core === undefined,
-    onError: (error) => logger.write("error", "assistant_work", "runtime_failed", { message: messageOf(error) }),
+    onError: (error) => logger.write("error", "assistant_work", "runtime_failed", { message: assistantWorkErrorMessage(error) }),
     report: async (report, key) => {
       const session = core?.session;
       if (!session || session.busy) return false;
@@ -401,15 +442,51 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
       });
     });
   };
+  /**
+   * Admits coordination envelopes from trusted peers as third-party evidence.
+   * A peer message never becomes an owner turn and never carries authority, so
+   * an unparseable body, an unknown handle, or a revoked peer is simply
+   * discarded with the rest of the non-owner batch.
+   */
+  const admitPeerEnvelopes = (messages: readonly InboundMessage[]): number => {
+    if (messages.length === 0) return 0;
+    const peers = store.listTrustedPeers("trusted");
+    if (peers.length === 0) return 0;
+    let admitted = 0;
+    for (const message of messages) {
+      if (message.senderHandle === undefined) continue;
+      try {
+        const result = admitInboundPeerMessage({
+          repository: store.assistantWork,
+          peers,
+          handle: message.senderHandle,
+          text: message.text,
+          receivedAt: new Date().toISOString(),
+        });
+        if (result.kind === "admitted") admitted += 1;
+      } catch (error) {
+        logger.write("error", "peers", "envelope_admission_failed", { message: messageOf(error) });
+      }
+    }
+    return admitted;
+  };
   const handleOwnerMessages = async (messages: readonly InboundMessage[]): Promise<void> => {
     const inbound = messages.filter((message) => !message.isFromMe);
     const owner = configuredHandle;
     const accepted = owner === undefined
       ? []
       : inbound.filter((message) => isAllowedHandle(message.senderHandle, owner));
-    const dropped = inbound.length - accepted.length;
+    const nonOwner = inbound.filter((message) => !accepted.includes(message));
+    // A non-owner sender is never an owner turn. A trusted peer's assistant may
+    // still deposit one coordination envelope as third-party evidence; anything
+    // else about that message is discarded here.
+    const peerAdmitted = admitPeerEnvelopes(nonOwner);
+    const dropped = nonOwner.length - peerAdmitted;
     if (dropped > 0) {
       logger.write("info", "imessage", "allowlist_dropped", { count: dropped });
+    }
+    if (peerAdmitted > 0) {
+      logger.write("info", "peers", "envelope_admitted", { count: peerAdmitted });
     }
     if (accepted.length > 0) {
       logger.write("info", "imessage", "owner_batch_received", { count: accepted.length });
@@ -1113,7 +1190,24 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonRu
           onMonitorsChanged: refreshAssistantMonitors,
         }),
         createManagedInstallTool({ repository: store.assistantWork }),
-        createManagedHttpTool({ repository: store.assistantWork, ...configuredHttpAccess() }),
+        createManagedHttpTool({ repository: store.assistantWork, ...httpAccess }),
+        ...(agentEmail === undefined ? [] : [createAgentEmailTool({
+          repository: store.assistantWork,
+          identity: agentEmail,
+          endpointPolicy: httpAccess.endpointPolicy,
+          resolveSecret: httpAccess.resolveSecret,
+        })]),
+        ...(callProvider === undefined ? [] : [createAgentCallTool({
+          repository: store.assistantWork,
+          provider: callProvider,
+          endpointPolicy: httpAccess.endpointPolicy,
+          resolveSecret: httpAccess.resolveSecret,
+        })]),
+        createPeerCoordinationTool({
+          repository: store.assistantWork,
+          peers: () => store.listTrustedPeers(),
+          port: () => imessage?.delivery.port,
+        }),
       ];
       const factory = options.mainSessionFactory ?? (drillMode
         ? new DrillMainSessionFactory({ customTools })
@@ -1526,6 +1620,34 @@ function ensureMessagesRunning(logger: NdjsonLogger): void {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Keep recovery context and root evidence without serializing arbitrary error payloads. */
+function assistantWorkErrorMessage(error: unknown): string {
+  const messages: string[] = [];
+  const seen = new Set<Error>();
+  let current = error;
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (current instanceof Error) {
+      if (seen.has(current)) {
+        messages.push("[cyclic cause]");
+        return messages.join("; caused by: ");
+      }
+      seen.add(current);
+      const message = current.message;
+      messages.push(message.length > 512 ? `${message.slice(0, 512)}…` : message);
+      if (current.cause === undefined) return messages.join("; caused by: ");
+      current = current.cause;
+    } else {
+      const message = current === null || ["string", "number", "boolean", "undefined", "bigint"].includes(typeof current)
+        ? String(current)
+        : "[non-Error cause]";
+      messages.push(message.length > 512 ? `${message.slice(0, 512)}…` : message);
+      return messages.join("; caused by: ");
+    }
+  }
+  messages.push("[cause depth limit]");
+  return messages.join("; caused by: ");
 }
 
 function hasCredentialEnvPatch(patch: JsonObject): boolean {

@@ -1,11 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { CONTROL_CAPABILITIES } from "../src/control/schema.ts";
 
 const daemonFixtures = fileURLToPath(new URL("./fixtures/control/", import.meta.url));
 const panelFixtures = fileURLToPath(new URL("../../panel/Tests/OpenInstinctPanelTests/Resources/control/", import.meta.url));
 
 describe("panel control fixture sync", () => {
+  test("negotiation fixture covers every advertised daemon capability", () => {
+    const negotiated = JSON.parse(readFileSync(`${daemonFixtures}negotiated.json`, "utf8"));
+    expect(negotiated.capabilities).toEqual([...CONTROL_CAPABILITIES]);
+  });
   test("keeps every Swift test fixture byte-identical to the daemon golden source", () => {
     const sourceFiles = readdirSync(daemonFixtures).filter((file) => file.endsWith(".json")).sort();
     const syncedFiles = readdirSync(panelFixtures).filter((file) => file.endsWith(".json")).sort();

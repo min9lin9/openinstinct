@@ -1,4 +1,6 @@
 import type { CustomTool } from "@gajae-code/coding-agent";
+import { actionMaterialDigest, type JsonValue } from "./model.ts";
+import { hasMaterialIntegrityViolation } from "../store/assistant-work.ts";
 import { Type } from "@gajae-code/coding-agent/extensibility/typebox";
 import type { AssistantWorkRepository } from "../store/assistant-work.ts";
 
@@ -27,7 +29,19 @@ export function createResponseCompletionTool(repository: AssistantWorkRepository
       if (!work || !action || action.workId !== work.id || action.state !== "confirmed") throw new Error("response must refer to a confirmed action in this work");
       if (input.observedWorkKey !== work.stableKey) throw new Error("response conversation key does not match the tracked work");
       const observedAt = Date.parse(input.observedAt);
-      const confirmed = repository.listAttempts(action.id).filter((attempt) => attempt.state === "confirmed");
+      // A confirmation recorded against rewritten material is a fact about what
+      // ran, not authority to complete work from it.
+      if (actionMaterialDigest(action) !== action.digest) {
+        throw new Error("response refers to an action whose material no longer matches its approved digest");
+      }
+      const allConfirmed = repository.listAttempts(action.id).filter((attempt) => attempt.state === "confirmed");
+      const confirmed = allConfirmed.filter((attempt) => !hasMaterialIntegrityViolation(attempt.outcome));
+      if (confirmed.length === 0 && allConfirmed.length > 0) {
+        // A confirmation exists, so "predates" would be a misleading diagnostic:
+        // the settlement is unusable because it was recorded against material
+        // that no longer matches what the owner approved.
+        throw new Error("response refers to a confirmation recorded against material that no longer matches its approved digest");
+      }
       if (!Number.isFinite(observedAt) || observedAt > Date.now() || !confirmed.some((attempt) => attempt.settledAt && Date.parse(attempt.settledAt) <= observedAt)) throw new Error("response predates confirmed outgoing action or has invalid time");
       if (!repository.listObservations(work.id).some((observation) => observation.source === input.source)) throw new Error("response source does not match the tracked work");
       const now = new Date().toISOString();
